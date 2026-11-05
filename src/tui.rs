@@ -4,7 +4,7 @@ mod theme;
 use crate::{
     config::Config,
     daemon::{self, Subscription},
-    domain::{Platform, PlaybackState, Snapshot, Track},
+    domain::{Platform, PlaybackState, Snapshot},
     protocol::AppCommand,
     services::ServiceCommand,
 };
@@ -48,8 +48,9 @@ enum Update {
         document: crate::lyrics::Lyrics,
     },
     Cover {
+        slot: cover::Slot,
         key: String,
-        png: Option<Vec<u8>>,
+        png: cover::Image,
     },
 }
 enum Action {
@@ -62,8 +63,8 @@ enum Action {
     Service(ServiceCommand),
     Lyrics(String),
     Cover {
-        key: String,
-        track: Track,
+        slot: cover::Slot,
+        target: Box<cover::Target>,
     },
 }
 
@@ -87,6 +88,7 @@ pub async fn run() -> Result<()> {
         let mut config_poll = tokio::time::interval(Duration::from_secs(3));
         let mut jobs = JoinSet::new();
         let mut queries = HashMap::<usize, tokio::task::AbortHandle>::new();
+        let mut cover_cache = cover::Cache::default();
         loop {
             tokio::select! {
                 _=config_poll.tick()=>{
@@ -99,9 +101,14 @@ pub async fn run() -> Result<()> {
                             if let Some(previous)=queries.remove(&99){previous.abort();}
                             let handle=jobs.spawn(async move{match daemon::call_value(AppCommand::Service{command:ServiceCommand::Lyrics{track:track.clone(),refresh:false}},false).await.and_then(|v|serde_json::from_value::<crate::lyrics::Lyrics>(v["lyrics"].clone()).map_err(Into::into)){Ok(document)=>Update::Lyrics{track,document},Err(error)=>Update::Error(error.to_string())}});queries.insert(99,handle);
                         }
-                        Action::Cover{key,track}=>{
-                            if let Some(previous)=queries.remove(&98){previous.abort();}
-                            let handle=jobs.spawn(async move { let png=cover::fetch(track).await.ok(); Update::Cover{key,png} }); queries.insert(98,handle);
+                        Action::Cover{slot,target}=>{
+                            if let Some(previous)=queries.remove(&slot.request_id()){previous.abort();}
+                            let key=target.key.clone();
+                            if let Some(png)=cover_cache.get(&key) {
+                                if updates.send(Update::Cover{slot,key,png}).await.is_err(){break;}
+                            } else {
+                                let handle=jobs.spawn(async move { let png=cover::fetch(*target).await.ok().map(std::sync::Arc::new); Update::Cover{slot,key,png} }); queries.insert(slot.request_id(),handle);
+                            }
                         }
                         Action::Control(command)=>{let command=if matches!(command,AppCommand::Play{..}|AppCommand::PlayEntry{..}|AppCommand::PlayCollection{..}|AppCommand::PlayLibrary{..}|AppCommand::Resume|AppCommand::Next|AppCommand::Previous){AppCommand::Detached{command:Box::new(command)}}else{command};jobs.spawn(async move{match daemon::call(command,false).await{Ok(snapshot)=>Update::Snapshot(snapshot),Err(error)=>Update::Error(error.to_string())}});},
                         Action::Service(command)=>{jobs.spawn(async move{match daemon::call_value(AppCommand::Service{command},false).await{Ok(value)=>if value["config"].is_object(){match serde_json::from_value(value["config"].clone()){Ok(config)=>Update::Config(config),Err(error)=>Update::Error(error.to_string())}}else if let Some(count)=value["playlist"]["count"].as_u64(){Update::SavedPlaylist{count:count as usize,already:value["already_saved"]==true}}else{Update::Message("Done".into())},Err(error)=>Update::Error(error.to_string())}});},
@@ -111,7 +118,14 @@ pub async fn run() -> Result<()> {
                         }
                     }
                 }
-                Some(result)=jobs.join_next(),if !jobs.is_empty()=>{if let Ok(update)=result&& updates.send(update).await.is_err(){break;}},
+                Some(result)=jobs.join_next(),if !jobs.is_empty()=>{
+                    if let Ok(update)=result {
+                        if let Update::Cover{key,png,..}=&update {
+                            cover_cache.insert(key.clone(),png.clone());
+                        }
+                        if updates.send(update).await.is_err(){break;}
+                    }
+                },
                 snapshot=subscription.next()=>match snapshot{
                     Ok(snapshot)=>{if updates.send(Update::Snapshot(snapshot)).await.is_err(){break;}},
                     Err(error)=>{
@@ -136,16 +150,15 @@ pub async fn run() -> Result<()> {
         browser: Browser::new(config.platform, config.language == "en"),
         config,
         cover_supported: cover::supported(),
-        cover_key: None,
-        cover_png: None,
-        cover_area: None,
+        preview: cover::State::default(),
+        playing_cover: cover::State::default(),
     };
     view.refresh(&actions, false);
-    view.request_cover(&actions);
     let result = tokio::task::spawn_blocking(move || {
         ratatui::run(|terminal| -> io::Result<()> {
             let mut dirty = true;
-            let mut cover_renderer = cover::Renderer::new();
+            let mut preview_renderer = cover::Renderer::new(cover::Slot::Preview);
+            let mut playing_renderer = cover::Renderer::new(cover::Slot::Playing);
             let mut refresh_at = std::time::Instant::now();
             loop {
                 while let Ok(update) = update_rx.try_recv() {
@@ -172,7 +185,6 @@ pub async fn run() -> Result<()> {
                                 });
                             view.queue.select(index);
                             view.snapshot = snapshot;
-                            view.request_cover(&actions);
                             if view.lyrics_mode {
                                 view.request_lyrics(&actions);
                             }
@@ -210,10 +222,11 @@ pub async fn run() -> Result<()> {
                                 view.lyrics = Some(document);
                             }
                         }
-                        Update::Cover { key, png } => {
-                            if view.cover_key.as_deref() == Some(&key) {
-                                view.cover_png = png;
-                            }
+                        Update::Cover { slot, key, png } => {
+                            match slot {
+                                cover::Slot::Preview => view.preview.apply(&key, png),
+                                cover::Slot::Playing => view.playing_cover.apply(&key, png),
+                            };
                         }
                         Update::SavedPlaylist { count, already } => {
                             view.message = if view.browser.english {
@@ -250,12 +263,20 @@ pub async fn run() -> Result<()> {
                     view.refresh(&actions, false);
                     refresh_at = std::time::Instant::now();
                 }
+                if view.sync_covers(&actions) {
+                    dirty = true;
+                }
                 if dirty {
                     terminal.draw(|frame| draw(frame, &mut view))?;
-                    cover_renderer.draw(
-                        view.cover_area,
-                        view.cover_key.as_deref(),
-                        view.cover_png.as_deref(),
+                    preview_renderer.draw(
+                        view.preview.area,
+                        view.preview.key(),
+                        view.preview.pixels(),
+                    )?;
+                    playing_renderer.draw(
+                        view.playing_cover.area,
+                        view.playing_cover.key(),
+                        view.playing_cover.pixels(),
                     )?;
                     dirty = false;
                 }
@@ -265,7 +286,8 @@ pub async fn run() -> Result<()> {
                 let key = match event::read()? {
                     Event::Key(key) if key.is_press() => key,
                     Event::Resize(_, _) => {
-                        cover_renderer.draw(None, None, None)?;
+                        preview_renderer.draw(None, None, None)?;
+                        playing_renderer.draw(None, None, None)?;
                         dirty = true;
                         continue;
                     }
@@ -503,32 +525,53 @@ struct View {
     browser: Browser,
     config: Config,
     cover_supported: bool,
-    cover_key: Option<String>,
-    cover_png: Option<Vec<u8>>,
-    cover_area: Option<Rect>,
+    preview: cover::State,
+    playing_cover: cover::State,
 }
 impl View {
-    fn request_cover(&mut self, actions: &mpsc::Sender<Action>) {
+    fn sync_covers(&mut self, actions: &mpsc::Sender<Action>) -> bool {
         if !self.cover_supported {
-            return;
+            return false;
         }
-        let track = self
+        let current = self
             .snapshot
             .current_entry()
-            .map(|entry| entry.track.clone());
-        let key = track
-            .as_ref()
-            .map(|track| format!("{}:{}", track.id, track.artwork.as_deref().unwrap_or("")));
-        if key == self.cover_key {
-            return;
+            .map(|entry| cover::Target::track(entry.track.clone()));
+        let selected = if self.lyrics_mode {
+            None
+        } else {
+            match self.focus {
+                1 => self.browser.cover_target(self.page),
+                2 => self
+                    .queue
+                    .selected()
+                    .and_then(|index| self.snapshot.queue.get(index))
+                    .map(|entry| cover::Target::track(entry.track.clone())),
+                _ => None,
+            }
+        };
+        let mut changed = self.playing_cover.set(current.clone(), Duration::ZERO);
+        changed |= self
+            .preview
+            .set(selected.or(current), Duration::from_millis(200));
+        for (slot, state) in [
+            (cover::Slot::Playing, &mut self.playing_cover),
+            (cover::Slot::Preview, &mut self.preview),
+        ] {
+            if let Some(target) = state.request() {
+                if actions
+                    .try_send(Action::Cover {
+                        slot,
+                        target: Box::new(target),
+                    })
+                    .is_err()
+                {
+                    state.retry();
+                }
+                changed = true;
+            }
         }
-        self.cover_key = key.clone();
-        self.cover_png = None;
-        if let (Some(key), Some(track)) = (key, track)
-            && actions.try_send(Action::Cover { key, track }).is_err()
-        {
-            self.cover_key = None;
-        }
+        changed
     }
     fn request_lyrics(&mut self, actions: &mpsc::Sender<Action>) {
         let current = self.snapshot.current_entry().map(|e| e.track.id.clone());
@@ -593,14 +636,21 @@ impl View {
     }
 }
 fn draw(frame: &mut Frame, view: &mut View) {
-    view.cover_area = None;
+    view.preview.area = None;
+    view.playing_cover.area = None;
     let english = view.browser.english;
     let theme = Theme::named(&view.config.theme);
     frame.render_widget(Block::new().style(theme.base()), frame.area());
     let rows = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(2),
-        Constraint::Length(3),
+        Constraint::Length(
+            if view.cover_supported && frame.area().width >= 64 && frame.area().height >= 24 {
+                6
+            } else {
+                3
+            },
+        ),
         Constraint::Length(if view.browser.input.is_some() { 3 } else { 2 }),
     ])
     .split(frame.area());
@@ -660,14 +710,14 @@ fn draw(frame: &mut Frame, view: &mut View) {
         && view.cover_supported
         && let Some(area) = content
         && area.width >= 44
-        && area.height >= 16
+        && area.height >= 12
     {
         let split = Layout::horizontal([Constraint::Min(20), Constraint::Length(24)]).split(area);
         content = Some(split[0]);
         draw_cover(
             frame,
             view,
-            Rect::new(split[1].x, split[1].y, split[1].width, 14),
+            Rect::new(split[1].x, split[1].y, split[1].width, area.height.min(14)),
         );
     }
     if let Some(area) = content {
@@ -729,8 +779,12 @@ fn draw(frame: &mut Frame, view: &mut View) {
         }
     }
     if let Some(mut area) = queue {
-        if view.cover_supported && area.width >= 24 && area.height >= 18 {
-            let split = Layout::vertical([Constraint::Length(14), Constraint::Min(4)]).split(area);
+        if view.cover_supported && area.width >= 24 && area.height >= 14 {
+            let split = Layout::vertical([
+                Constraint::Length(area.height.saturating_sub(4).min(14)),
+                Constraint::Min(4),
+            ])
+            .split(area);
             draw_cover(frame, view, split[0]);
             area = split[1];
         }
@@ -806,37 +860,109 @@ fn draw(frame: &mut Frame, view: &mut View) {
         PlaybackState::Error => theme.error,
         _ => theme.muted,
     };
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                format!(" {title}"),
-                Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" | ", Style::default().fg(theme.border)),
-            Span::styled(state, Style::default().fg(state_color)),
-            Span::styled(
-                format!(" {:.0}s / {duration}", view.snapshot.position),
-                Style::default().fg(theme.muted),
-            ),
-            Span::styled(" | ", Style::default().fg(theme.border)),
-            Span::styled(
-                format!(
-                    "{} {}%",
-                    if english { "Volume" } else { "音量" },
-                    view.snapshot.volume
-                ),
-                Style::default().fg(theme.secondary),
-            ),
-            Span::styled(format!(" · {mode}"), Style::default().fg(theme.accent)),
-        ]))
-        .style(theme.base().bg(theme.panel))
-        .block(
-            theme
-                .block(if english { "Player" } else { "播放" }, false)
-                .style(theme.base().bg(theme.panel)),
+    let status = Line::from(vec![
+        Span::styled(
+            format!(" {title}"),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         ),
-        rows[2],
-    );
+        Span::styled(" | ", Style::default().fg(theme.border)),
+        Span::styled(state, Style::default().fg(state_color)),
+        Span::styled(
+            format!(" {:.0}s / {duration}", view.snapshot.position),
+            Style::default().fg(theme.muted),
+        ),
+        Span::styled(" | ", Style::default().fg(theme.border)),
+        Span::styled(
+            format!(
+                "{} {}%",
+                if english { "Volume" } else { "音量" },
+                view.snapshot.volume
+            ),
+            Style::default().fg(theme.secondary),
+        ),
+        Span::styled(format!(" · {mode}"), Style::default().fg(theme.accent)),
+    ]);
+    if rows[2].height >= 6 {
+        let block = theme
+            .block(
+                if english {
+                    "Now playing"
+                } else {
+                    "正在播放"
+                },
+                false,
+            )
+            .style(theme.base().bg(theme.panel));
+        let inner = block.inner(rows[2]);
+        frame.render_widget(block, rows[2]);
+        let image = Rect::new(inner.x, inner.y, 8.min(inner.width), inner.height.min(4));
+        if view.playing_cover.png.is_some() {
+            view.playing_cover.area = Some(image);
+        } else {
+            frame.render_widget(
+                Paragraph::new("♪")
+                    .alignment(ratatui::layout::Alignment::Center)
+                    .style(theme.subdued().bg(theme.panel)),
+                Rect::new(image.x, image.y + image.height / 2, image.width, 1),
+            );
+        }
+        let info = Rect::new(
+            inner.x + 10.min(inner.width),
+            inner.y,
+            inner.width.saturating_sub(10),
+            inner.height,
+        );
+        let artist = view
+            .snapshot
+            .current_entry()
+            .map(|entry| {
+                format!(
+                    "{}{}{}",
+                    entry.track.artist,
+                    if entry.track.artist.is_empty() || entry.track.album.is_empty() {
+                        ""
+                    } else {
+                        " · "
+                    },
+                    entry.track.album
+                )
+            })
+            .unwrap_or_default();
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::styled(
+                    title,
+                    Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+                ),
+                Line::styled(artist, Style::default().fg(theme.muted)),
+                Line::from(vec![
+                    Span::styled(state, Style::default().fg(state_color)),
+                    Span::styled(
+                        format!(
+                            "  {:.0}s / {duration}  |  {} {}%  ·  {mode}",
+                            view.snapshot.position,
+                            if english { "Volume" } else { "音量" },
+                            view.snapshot.volume
+                        ),
+                        Style::default().fg(theme.secondary),
+                    ),
+                ]),
+            ])
+            .style(theme.base().bg(theme.panel)),
+            info,
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new(status)
+                .style(theme.base().bg(theme.panel))
+                .block(
+                    theme
+                        .block(if english { "Player" } else { "播放" }, false)
+                        .style(theme.base().bg(theme.panel)),
+                ),
+            rows[2],
+        );
+    }
     if let Some(input) = &view.browser.input {
         frame.render_widget(
             Paragraph::new(format!(" / {input}"))
@@ -882,33 +1008,25 @@ fn draw(frame: &mut Frame, view: &mut View) {
 
 fn draw_cover(frame: &mut Frame, view: &mut View, cover: Rect) {
     let theme = Theme::named(&view.config.theme);
-    frame.render_widget(
-        theme.block(
-            if view.browser.english {
-                "Cover"
-            } else {
-                "封面"
-            },
-            false,
-        ),
-        cover,
+    let block = theme.block(
+        if view.browser.english {
+            "Preview"
+        } else {
+            "预览"
+        },
+        false,
     );
-    if view.cover_png.is_none() {
-        frame.render_widget(
-            Paragraph::new(if view.browser.english {
-                "No cover"
-            } else {
-                "暂无封面"
-            })
-            .style(theme.subdued()),
-            Rect::new(cover.x + 1, cover.y + 1, cover.width.saturating_sub(2), 1),
-        );
-    } else {
-        view.cover_area = Some(Rect::new(
-            cover.x + 1,
-            cover.y + 1,
-            cover.width.saturating_sub(2),
-            cover.height.saturating_sub(2),
-        ));
+    let inner = block.inner(cover);
+    frame.render_widget(block, cover);
+    let height = inner.height.min(inner.width / 2).max(1);
+    let width = inner.width.min(height * 2);
+    let image = Rect::new(
+        inner.x + (inner.width - width) / 2,
+        inner.y + inner.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    if view.preview.png.is_some() {
+        view.preview.area = Some(image);
     }
 }

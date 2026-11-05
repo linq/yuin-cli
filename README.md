@@ -93,7 +93,7 @@ The default page is Playlists. `/` searches playlists on that page and tracks el
 
 The default Catppuccin Macchiato theme uses blue-gray backgrounds, mauve selections, blue prompts and green playback status. Terminal/default, dark and light themes remain available.
 
-Ghostty, WezTerm and Kitty display the current track's cover when the terminal is large enough. Missing artwork, unsupported terminals and tmux/screen use the text interface; artwork fetch failures do not interrupt playback.
+Ghostty, WezTerm and Kitty show two independent covers when space permits: the image-only right preview follows the selected playlist/track, while the player-bar thumbnail always follows actual playback. Preview loads wait about 200 ms and reuse a bounded memory cache. Saved playlists use artwork from their tracks when no separate cover is available. With no browsing selection or in lyrics view, the large preview follows playback. Missing preview images leave the panel empty; narrow windows collapse images, and unsupported terminals or tmux/screen use text. Artwork failures do not interrupt playback.
 
 On a playlist/chart list or detail page, **F (Shift+f)** favorites the complete collection and **b** plays it. Saved playlists in My Library also support b. Lowercase f favorites individual tracks in detail pages and the selected whole playlist in playlist lists. Search input keeps these keys as text.
 

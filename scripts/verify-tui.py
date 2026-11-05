@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import pty
+import re
 import select
 import shutil
 import signal
@@ -34,9 +35,12 @@ with tempfile.TemporaryDirectory(prefix="yuin-pty-") as directory:
     env.pop('NO_COLOR', None)
     def png_chunk(kind, data):
         return struct.pack('!I', len(data)) + kind + data + struct.pack('!I', zlib.crc32(kind + data))
-    png = b'\x89PNG\r\n\x1a\n' + png_chunk(b'IHDR', struct.pack('!IIBBBBB', 2, 2, 8, 6, 0, 0, 0)) + png_chunk(b'IDAT', zlib.compress((b'\x00' + b'\xff\x00\x00\xff' * 2) * 2)) + png_chunk(b'IEND', b'')
+    def cover_image(color):
+        return b'\x89PNG\r\n\x1a\n' + png_chunk(b'IHDR', struct.pack('!IIBBBBB', 2, 2, 8, 6, 0, 0, 0)) + png_chunk(b'IDAT', zlib.compress((b'\x00' + bytes(color) * 2) * 2)) + png_chunk(b'IEND', b'')
+    covers = {'/playlist-cover.png': cover_image((255,0,0,255)), '/cover.png': cover_image((0,0,255,255)), '/cover2.png': cover_image((0,255,0,255)), '/cover3.png': cover_image((255,255,0,255))}
     class CatalogFixture(http.server.BaseHTTPRequestHandler):
         searches = []
+        cover_requests = []
         def log_message(self, *args):
             pass
         def do_GET(self):
@@ -46,18 +50,19 @@ with tempfile.TemporaryDirectory(prefix="yuin-pty-") as directory:
                 kind = query.get('type', [''])[0]
                 type(self).searches.append((query.get('s', [''])[0], kind))
                 if kind == '1000':
-                    data = json.dumps({'code':200,'result':{'playlists':[{'id':10,'name':'Playlist fixture'}],'playlistCount':1}}).encode()
+                    data = json.dumps({'code':200,'result':{'playlists':[{'id':10,'name':'Playlist fixture','coverImgUrl':f'http://127.0.0.1:{self.server.server_port}/playlist-cover.png'}],'playlistCount':1}}).encode()
                 else:
-                    data = json.dumps({'code':200,'result':{'songs':[{'id':1,'name':'Search fixture','artists':[],'album':{'picUrl':f'http://127.0.0.1:{self.server.server_port}/cover.png'},'duration':1000}],'songCount':1}}).encode()
-            elif parsed.path == '/cover.png':
-                data = png
+                    data = json.dumps({'code':200,'result':{'songs':[{'id':n,'name':f'Search fixture {n}','artists':[],'album':{'picUrl':f'http://127.0.0.1:{self.server.server_port}/cover{n if n>1 else ""}.png'},'duration':60000} for n in range(1,4)],'songCount':3}}).encode()
+            elif parsed.path in covers:
+                type(self).cover_requests.append(parsed.path)
+                data = covers[parsed.path]
             elif parsed.path == '/audio.wav':
                 data = audio.read_bytes()
             elif parsed.path == '/api/v3/playlist/detail':
                 data = json.dumps({'code':200,'playlist':{'trackCount':playlist_size,'trackIds':[{'id':n} for n in range(1,playlist_size+1)]}}).encode()
             elif parsed.path == '/api/v3/song/detail':
                 ids = json.loads(urllib.parse.parse_qs(parsed.query)['ids'][0])
-                data = json.dumps({'code':200,'songs':[{'id':n,'name':f'Playlist track {n}','ar':[],'al':{'id':8,'name':'海'*700 if playlist_size>2 else 'Album'},'dt':60000} for n in ids]}).encode()
+                data = json.dumps({'code':200,'songs':[{'id':n,'name':f'Playlist track {n}','ar':[],'al':{'id':8,'name':'海'*700 if playlist_size>2 else 'Album','picUrl':f'http://127.0.0.1:{self.server.server_port}/cover.png'},'dt':60000} for n in ids]}).encode()
             else:
                 data = b'{"code":200,"playlists":[],"list":[],"total":0}'
             self.send_response(200)
@@ -85,6 +90,15 @@ with tempfile.TemporaryDirectory(prefix="yuin-pty-") as directory:
     original = termios.tcgetattr(slave)
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
     child = None
+    transcript = bytearray()
+
+    def read_output():
+        data = os.read(master, 65536)
+        transcript.extend(data)
+        return data
+
+    def image_commands(offset=0):
+        return [tuple(map(int, values)) for values in re.findall(rb'\x1b_Ga=T,[^;]*?i=(\d+),[^;]*?c=(\d+),r=(\d+)', transcript[offset:])]
 
     def read_until(needle, timeout=10):
         data = bytearray()
@@ -92,7 +106,7 @@ with tempfile.TemporaryDirectory(prefix="yuin-pty-") as directory:
         while time.monotonic() < deadline:
             ready, _, _ = select.select([master], [], [], 0.05)
             if ready:
-                data.extend(os.read(master, 65536))
+                data.extend(read_output())
                 if needle in data:
                     return
             if child.poll() is not None:
@@ -104,7 +118,7 @@ with tempfile.TemporaryDirectory(prefix="yuin-pty-") as directory:
         while time.monotonic() < deadline:
             ready, _, _ = select.select([master], [], [], 0.025)
             if ready:
-                os.read(master, 65536)
+                read_output()
 
     def wait_state(expected):
         deadline = time.monotonic() + 5
@@ -138,6 +152,8 @@ with tempfile.TemporaryDirectory(prefix="yuin-pty-") as directory:
         os.write(master, b"/playlist\r")
         read_until(b"Playlist fixture")
         assert CatalogFixture.searches[-1] == ('playlist', '1000')
+        pump(.4)
+        assert '/playlist-cover.png' in CatalogFixture.cover_requests
         os.write(master, b'F')
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
@@ -181,10 +197,48 @@ with tempfile.TemporaryDirectory(prefix="yuin-pty-") as directory:
                 break
         assert queue[-1]["track"]["id"] == 'wy:1', queue
         if not real:
-            cli('play', 'wy:1')
+            marker = len(transcript)
+            song_playing = cli('play', 'wy:1')
             read_until(b'\x1b_Ga=T,f=100')
+            pump(.4)
+            thumbnail = [image for image in image_commands(marker) if image[1:] == (8,4)]
+            assert thumbnail, image_commands(marker)
+            playing_image_id = thumbnail[-1][0]
+            preview_image_id = next(image[0] for image in image_commands() if image[1] >= 12 and image[2] >= 5)
+            assert playing_image_id != preview_image_id
+            marker = len(transcript)
+            os.write(master, b'jjk')
+            pump(1)
+            assert CatalogFixture.cover_requests.count('/cover2.png') == 1, CatalogFixture.cover_requests
+            assert '/cover3.png' not in CatalogFixture.cover_requests, CatalogFixture.cover_requests
+            assert cli('status')['current'] == song_playing['current']
+            assert any(image[0] == preview_image_id for image in image_commands(marker))
+            assert all(image[0] != playing_image_id for image in image_commands(marker))
+            marker = len(transcript)
+            cli('queue', 'add', 'wy:3')
+            song_playing = cli('next')
+            read_until(b'\x1b_Ga=T,f=100')
+            pump(.4)
+            assert CatalogFixture.cover_requests.count('/cover3.png') == 1
+            assert any(image[0] == playing_image_id for image in image_commands(marker))
+            assert all(image[0] != preview_image_id for image in image_commands(marker))
+            requests = len(CatalogFixture.cover_requests)
+            os.write(master, b'k')
+            pump(.4)
+            assert len(CatalogFixture.cover_requests) == requests, 'Song cover should be cached'
+            marker = len(transcript)
+            os.write(master, b'2')
+            pump(.4)
+            assert len(CatalogFixture.cover_requests) == requests, 'Playlist cover should be cached'
+            assert cli('status')['current'] == song_playing['current']
+            assert any(image[0] == preview_image_id for image in image_commands(marker))
+            assert all(image[0] != playing_image_id for image in image_commands(marker))
+            marker = len(transcript)
             playing = cli('play', str(audio))
             read_until(b'\x1b_Ga=d,d=I')
+            deleted = re.findall(rb'\x1b_Ga=d,d=I,i=(\d+),q=2',transcript[marker:])
+            assert str(playing_image_id).encode() in deleted
+            assert str(preview_image_id).encode() not in deleted
         os.write(master, b"3")
         read_until(b"Charts")
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 12, 60, 0, 0))
@@ -195,7 +249,7 @@ with tempfile.TemporaryDirectory(prefix="yuin-pty-") as directory:
         while child.poll() is None and time.monotonic() < deadline:
             ready, _, _ = select.select([master], [], [], 0.05)
             if ready:
-                os.read(master, 65536)
+                read_output()
         assert child.poll() == 0, f"Exit code: {child.poll()}"
         assert termios.tcgetattr(slave) == original, "Terminal settings were not restored"
         after = cli("status")
@@ -203,7 +257,7 @@ with tempfile.TemporaryDirectory(prefix="yuin-pty-") as directory:
         if real:
             time.sleep(0.3)
             assert cli("status")["position"] > after["position"]
-        print(f"PTY PASS ({'real mpv' if real else 'fixture'}): {playlist_size}-track playlist F/b, controls, cross-client updates, resize, clean exit, termios restore, playback survives TUI exit")
+        print(f"PTY PASS ({'real mpv' if real else 'fixture'}): {playlist_size}-track playlist F/b, independent cover previews/cache/debounce, controls, resize and clean exit")
     finally:
         if child and child.poll() is None:
             child.kill()

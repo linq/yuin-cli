@@ -1,3 +1,4 @@
+use super::cover::Target;
 use super::theme::Theme;
 use crate::{domain::Platform, protocol::AppCommand, services::ServiceCommand};
 use ratatui::{
@@ -206,6 +207,30 @@ impl Browser {
             _ => None,
         }
     }
+    pub fn cover_target(&self, index: usize) -> Option<Target> {
+        let value = self.selected(index)?;
+        match self.routes[index].content.kind {
+            Kind::Collections { .. } => Some(Target::playlist(
+                value["id"].as_str()?,
+                value["title"].as_str().unwrap_or_default().into(),
+                value["subtitle"].as_str().unwrap_or_default().into(),
+                value["artwork"].as_str().map(str::to_owned),
+            )),
+            Kind::Library => Some(Target::library(
+                value["id"].as_str()?.parse().ok()?,
+                value["name"].as_str().unwrap_or_default().into(),
+                value["count"].as_u64().unwrap_or_default(),
+            )),
+            Kind::Downloads => serde_json::from_value(value["track"].clone())
+                .ok()
+                .map(Target::track),
+            Kind::Search | Kind::Tracks { .. } | Kind::LibraryTracks { .. } => {
+                serde_json::from_value(value.clone())
+                    .ok()
+                    .map(Target::track)
+            }
+        }
+    }
     fn collection(&self, index: usize) -> Option<(String, bool, String)> {
         match &self.routes[index].content.kind {
             Kind::Collections { charts } => {
@@ -381,6 +406,24 @@ impl Browser {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn preview_follows_collection_then_track_without_starting_playback() {
+        let mut browser = Browser::new(Platform::Wy, true);
+        let (version, _) = browser.query(1, false).unwrap();
+        browser.apply(1,version,json!({"items":[{"id":"wy:10","title":"Playlist","subtitle":"Author","artwork":"https://example.com/playlist.png"}]}));
+        let preview = browser.cover_target(1).unwrap();
+        assert!(preview.kind == super::super::cover::Kind::Playlist);
+        assert_eq!(preview.title, "Playlist");
+        assert_eq!(preview.subtitle, "Author");
+        assert!(browser.enter(1));
+        let (version, _) = browser.query(1, false).unwrap();
+        browser.apply(1,version,json!({"items":[{"id":"wy:1","title":"Track","artist":"Artist","artwork":"https://example.com/song.png"}]}));
+        let preview = browser.cover_target(1).unwrap();
+        assert!(preview.kind == super::super::cover::Kind::Track);
+        assert_eq!(preview.title, "Track");
+        assert!(browser.back(1));
+        assert_eq!(browser.cover_target(1).unwrap().title, "Playlist");
+    }
     #[test]
     fn playlist_search_uses_platform_and_retains_paging() {
         let mut browser = Browser::new(Platform::Kg, true);
