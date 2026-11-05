@@ -1,9 +1,11 @@
-use crate::{domain::Platform, services::ServiceCommand};
+use super::theme::Theme;
+use crate::{domain::Platform, protocol::AppCommand, services::ServiceCommand};
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Color, Style},
-    widgets::{Block, List, ListItem, ListState, Paragraph, Wrap},
+    style::Style,
+    text::{Line, Span},
+    widgets::{List, ListItem, ListState, Paragraph, Wrap},
 };
 use serde_json::Value;
 use std::collections::HashSet;
@@ -92,6 +94,13 @@ impl Browser {
                     return None;
                 }
                 ServiceCommand::Search {
+                    query: route.query.clone(),
+                    platform: Some(self.platform),
+                    page,
+                }
+            }
+            Kind::Collections { charts: false } if !route.query.trim().is_empty() => {
+                ServiceCommand::SearchCollections {
                     query: route.query.clone(),
                     platform: Some(self.platform),
                     page,
@@ -197,6 +206,42 @@ impl Browser {
             _ => None,
         }
     }
+    fn collection(&self, index: usize) -> Option<(String, bool, String)> {
+        match &self.routes[index].content.kind {
+            Kind::Collections { charts } => {
+                let selected = self.selected(index)?;
+                Some((
+                    selected["id"].as_str()?.into(),
+                    *charts,
+                    selected["title"].as_str().unwrap_or("Playlist").into(),
+                ))
+            }
+            Kind::Tracks { id, chart } => {
+                Some((id.clone(), *chart, self.routes[index].content.title.clone()))
+            }
+            _ => None,
+        }
+    }
+    pub fn playlist_play(&self, index: usize) -> Option<AppCommand> {
+        if let Some((id, chart, _)) = self.collection(index) {
+            return Some(AppCommand::PlayCollection { id, chart });
+        }
+        let id = match self.routes[index].content.kind {
+            Kind::Library => self.selected(index)?["id"].as_str()?.parse().ok()?,
+            Kind::LibraryTracks { id } => id,
+            _ => return None,
+        };
+        Some(AppCommand::PlayLibrary { id })
+    }
+    pub fn playlist_favorite(&self, index: usize) -> Option<ServiceCommand> {
+        let (collection, chart, name) = self.collection(index)?;
+        let name = name.chars().take(64).collect();
+        Some(ServiceCommand::LibraryFavorite {
+            collection,
+            chart,
+            name,
+        })
+    }
     pub fn enter(&mut self, index: usize) -> bool {
         let Some(value) = self.selected(index).cloned() else {
             return false;
@@ -246,19 +291,16 @@ impl Browser {
             false
         }
     }
-    pub fn draw(
-        &mut self,
-        frame: &mut Frame,
-        area: Rect,
-        index: usize,
-        focus: bool,
-        accent: Color,
-    ) {
+    pub fn draw(&mut self, frame: &mut Frame, area: Rect, index: usize, focus: bool, theme: Theme) {
         let route = &mut self.routes[index];
         let page = &mut route.content;
         let title = format!(
             " {}{} · {}{}{} ",
-            page.title,
+            if index == 1 && !route.query.trim().is_empty() {
+                format!("{}: {}", page.title, route.query)
+            } else {
+                page.title.clone()
+            },
             if focus { " •" } else { "" },
             page.items.len(),
             page.total.map(|n| format!("/{n}")).unwrap_or_default(),
@@ -286,8 +328,9 @@ impl Browser {
             };
             frame.render_widget(
                 Paragraph::new(text)
+                    .style(theme.subdued())
                     .wrap(Wrap { trim: false })
-                    .block(Block::bordered().title(title)),
+                    .block(theme.block(title, focus)),
                 area,
             );
             return;
@@ -310,12 +353,23 @@ impl Browser {
             } else {
                 String::new()
             };
-            ListItem::new(format!("{title}  {artist}{extra}"))
+            let extra_color = match state {
+                "completed" => theme.success,
+                "failed" => theme.error,
+                "pending" | "downloading" => theme.warning,
+                _ => theme.muted,
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(title.to_owned(), Style::default().fg(theme.text)),
+                Span::styled(format!("  {artist}"), Style::default().fg(theme.muted)),
+                Span::styled(extra, Style::default().fg(extra_color)),
+            ]))
         });
         frame.render_stateful_widget(
             List::new(items)
-                .block(Block::bordered().title(title))
-                .highlight_style(Style::default().fg(accent))
+                .style(theme.base())
+                .block(theme.block(title, focus))
+                .highlight_style(theme.selected(focus))
                 .highlight_symbol("› "),
             area,
             &mut page.list,
@@ -327,6 +381,27 @@ impl Browser {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn playlist_search_uses_platform_and_retains_paging() {
+        let mut browser = Browser::new(Platform::Kg, true);
+        browser.routes[1].query = "jazz".into();
+        let (_, command) = browser.query(1, false).unwrap();
+        assert!(
+            matches!(command, ServiceCommand::SearchCollections { ref query, platform: Some(Platform::Kg), page: 1 } if query == "jazz")
+        );
+        browser.routes[1].content.page = 1;
+        let (_, command) = browser.query(1, true).unwrap();
+        assert!(matches!(
+            command,
+            ServiceCommand::SearchCollections { page: 2, .. }
+        ));
+        browser.routes[1].query.clear();
+        let (_, command) = browser.query(1, false).unwrap();
+        assert!(matches!(
+            command,
+            ServiceCommand::Collections { charts: false, .. }
+        ));
+    }
     #[test]
     fn stale_queries_are_ignored_and_append_and_back_preserve_selection_and_scroll() {
         let mut browser = Browser::new(Platform::Wy, true);

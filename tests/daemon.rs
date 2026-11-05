@@ -281,6 +281,49 @@ fn missing_backend_and_decode_failure_return_audio_errors() {
 }
 
 #[test]
+fn legacy_daemon_rejection_explains_how_to_restart() {
+    use std::os::unix::net::UnixListener;
+    let session = Session::new();
+    fs::create_dir(&session.runtime).unwrap();
+    fs::set_permissions(&session.runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = session.runtime.join("daemon.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let request: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["params"]["command"]["op"], "search_collections");
+        writeln!(stream, "{}", json!({"version":1,"request_id":"00000000-0000-0000-0000-000000000000","error":{"code":2,"message":"Invalid request JSON or method"}})).unwrap();
+    });
+    let output = session.output(&["playlists", "search", "fixture"]);
+    server.join().unwrap();
+    fs::remove_file(socket).unwrap();
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["code"], 6);
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("daemon stop"),
+        "{error}"
+    );
+}
+
+#[test]
+fn unknown_service_preserves_request_identity() {
+    let session = Session::new();
+    session.json(&["status"]);
+    let id = "7000d328-94fb-4b96-9861-75424d9297b0";
+    let response = session.request(json!({"version":1,"request_id":id,"method":"service","params":{"command":{"op":"future_search"}}}));
+    assert_eq!(response["request_id"], id);
+    assert_eq!(response["error"]["code"], 2);
+}
+
+#[test]
 fn protocol_rejects_bad_requests_and_bounds_input() {
     let session = Session::new();
     session.json(&["status"]);
@@ -552,4 +595,35 @@ fn an_accepted_detached_load_survives_its_ui_connection_closing() {
     assert!(response["error"].is_null(), "{response}");
     assert!(start.elapsed() < Duration::from_millis(500));
     session.wait_state("playing");
+}
+
+#[test]
+fn cancelled_playlist_load_restores_old_queue_and_keeps_concurrent_additions() {
+    let session = Session::new();
+    let old = session.audio("old.wav");
+    let slow = session.audio("slow-start.wav");
+    let next = session.audio("other.wav");
+    let added = session.audio("concurrent.wav");
+    let before = session.json(&["play", old.to_str().unwrap()]);
+    let id = session.json(&["library", "create", "batch"])["playlist"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    session.json(&["library", "add", &id, slow.to_str().unwrap()]);
+    session.json(&["library", "add", &id, next.to_str().unwrap()]);
+    let mut socket = UnixStream::connect(session.runtime.join("daemon.sock")).unwrap();
+    writeln!(socket,"{}",json!({"version":1,"request_id":"7000d328-94fb-4b96-9861-75424d9297b0","method":"play_library","params":{"id":id}})).unwrap();
+    session.wait_state("buffering");
+    let during = session.json(&["queue", "add", added.to_str().unwrap()]);
+    assert_eq!(during["queue"].as_array().unwrap().len(), 3);
+    drop(socket);
+    let after = session.wait_state("paused");
+    let queue = after["queue"].as_array().unwrap();
+    assert_eq!(queue.len(), 2);
+    assert_eq!(queue[0], before["queue"][0]);
+    assert_eq!(
+        queue[1]["track"]["path"],
+        added.canonicalize().unwrap().to_str().unwrap()
+    );
+    assert_eq!(after["current"], before["current"]);
 }

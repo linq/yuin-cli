@@ -242,9 +242,11 @@ impl Storage {
         self.execute(move |db| {
             let tx=db.transaction()?;
             let text=tx.query_row("SELECT metadata FROM playlists WHERE id=?1",[id.to_string()],|r|r.get::<_,String>(0)).optional()?;
-            let mut list:crate::domain::LocalPlaylist=if let Some(text)=text {serde_json::from_str(&text)?} else {ensure!(matches!(edit,LibraryEdit::Create{..}|LibraryEdit::CreateWithTracks{..}),"Library list not found");crate::domain::LocalPlaylist{id,name:String::new(),tracks:Vec::new()}};
+            let existed=text.is_some();
+            let mut list:crate::domain::LocalPlaylist=if let Some(text)=text {serde_json::from_str(&text)?} else {ensure!(matches!(edit,LibraryEdit::Create{..}|LibraryEdit::CreateWithTracks{..}|LibraryEdit::CreateOnce{..}),"Library list not found");crate::domain::LocalPlaylist{id,name:String::new(),tracks:Vec::new()}};
+            if existed && matches!(edit,LibraryEdit::CreateOnce{..}) {return Ok(list);}
             match edit {
-                LibraryEdit::CreateWithTracks{name,tracks}=>{list.name=name;let mut seen=std::collections::HashSet::new();for track in tracks{cache_track(&tx,&track)?;if seen.insert(track.id.clone()){list.tracks.push(track);}}},
+                LibraryEdit::CreateWithTracks{name,tracks}|LibraryEdit::CreateOnce{name,tracks}=>{list.name=name;let mut seen=std::collections::HashSet::new();for track in tracks{cache_track(&tx,&track)?;if seen.insert(track.id.clone()){list.tracks.push(track);}}},
                 LibraryEdit::Create{name} | LibraryEdit::Rename{name} => list.name=name,
                 LibraryEdit::Add{tracks} => {let mut seen:std::collections::HashSet<_>=list.tracks.iter().map(|t|t.id.clone()).collect();for track in tracks {cache_track(&tx,&track)?;if seen.insert(track.id.clone()){list.tracks.push(track);}}},
                 LibraryEdit::Remove{index} => {ensure!(index<list.tracks.len(),"Track index out of range");list.tracks.remove(index);},
@@ -282,6 +284,10 @@ impl RecordKind {
     }
 }
 pub enum LibraryEdit {
+    CreateOnce {
+        name: String,
+        tracks: Vec<crate::domain::Track>,
+    },
     CreateWithTracks {
         name: String,
         tracks: Vec<crate::domain::Track>,

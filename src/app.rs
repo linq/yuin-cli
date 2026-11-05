@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
 use tokio::{
     sync::{broadcast, mpsc, oneshot, watch},
@@ -9,13 +9,13 @@ use uuid::Uuid;
 use crate::{
     domain::{PlaybackMode, PlaybackState, QueueEntry, Snapshot},
     playback::{BackendEvent, Event, Mpv},
-    protocol::{AppCommand, MAX_FRAME, MAX_QUEUE, RpcError},
+    protocol::{AppCommand, MAX_QUEUE, MAX_RESPONSE_FRAME, RpcError},
     storage::Storage,
 };
 
 pub struct Envelope {
     pub command: AppCommand,
-    pub prepared: Option<crate::domain::Track>,
+    pub prepared: Option<Vec<crate::domain::Track>>,
     pub detached: bool,
     pub reply: oneshot::Sender<Result<Snapshot, RpcError>>,
 }
@@ -28,7 +28,8 @@ struct Loaded {
 struct Pending {
     reply: oneshot::Sender<Result<Snapshot, RpcError>>,
     before: Snapshot,
-    added: Option<Uuid>,
+    added: HashSet<Uuid>,
+    replaced: bool,
 }
 
 pub struct Core {
@@ -98,7 +99,8 @@ impl Core {
                     let Some(envelope) = envelope else { break Ok(()); };
                     if envelope.reply.is_closed() { continue; }
                     let stop = matches!(envelope.command, AppCommand::Shutdown);
-                    let waits=!envelope.detached && matches!(envelope.command,AppCommand::Play{..}|AppCommand::PlayEntry{..}|AppCommand::Resume|AppCommand::Next|AppCommand::Previous);
+                    let replaced=matches!(envelope.command,AppCommand::PlayCollection{..}|AppCommand::PlayLibrary{..});
+                    let waits=!envelope.detached && matches!(envelope.command,AppCommand::Play{..}|AppCommand::PlayEntry{..}|AppCommand::PlayCollection{..}|AppCommand::PlayLibrary{..}|AppCommand::Resume|AppCommand::Next|AppCommand::Previous);
                     let before = self.state.clone();
                     let mut reply = envelope.reply;
                     let result = tokio::select! {
@@ -118,8 +120,9 @@ impl Core {
                     let success = result.is_ok();
                     if waits && success && self.loading.is_some(){
                         if let Some(previous)=self.pending.take(){let _=previous.reply.send(Err(RpcError::new(6,"Playback request superseded")));}
-                        let added=self.state.current.filter(|id|!before.queue.iter().any(|entry|entry.id==*id));
-                        self.pending=Some(Pending{reply,before,added});
+                        let old_ids=before.queue.iter().map(|entry|entry.id).collect::<HashSet<_>>();
+                        let added=self.state.queue.iter().filter(|entry|!old_ids.contains(&entry.id)).map(|entry|entry.id).collect();
+                        self.pending=Some(Pending{reply,before,added,replaced});
                     }else{let _ = reply.send(result);}
                     if self.loading.is_none() && let Some(pending)=self.pending.take(){let _=pending.reply.send(Ok(self.state.clone()));}
                     if stop && success { break Ok(()); }
@@ -203,8 +206,23 @@ impl Core {
 
     async fn cancel_pending(&mut self, pending: Pending) -> anyhow::Result<()> {
         self.stop_backend().await;
-        if let Some(id) = pending.added {
-            self.state.queue.retain(|entry| entry.id != id);
+        self.state
+            .queue
+            .retain(|entry| !pending.added.contains(&entry.id));
+        if pending.replaced {
+            let appended = std::mem::take(&mut self.state.queue);
+            self.state.queue = pending.before.queue.clone();
+            let mut seen = self
+                .state
+                .queue
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<HashSet<_>>();
+            for entry in appended {
+                if seen.insert(entry.id) {
+                    self.state.queue.push(entry);
+                }
+            }
         }
         self.state.current = pending
             .before
@@ -331,7 +349,7 @@ impl Core {
     async fn handle(
         &mut self,
         command: AppCommand,
-        prepared: Option<crate::domain::Track>,
+        prepared: Option<Vec<crate::domain::Track>>,
     ) -> Result<Snapshot, RpcError> {
         self.advance_position();
         if matches!(command, AppCommand::Snapshot | AppCommand::Subscribe) {
@@ -344,21 +362,45 @@ impl Core {
         let clear = matches!(command, AppCommand::QueueClear);
         let action = async {
             match command {
+                AppCommand::PlayCollection { .. } | AppCommand::PlayLibrary { .. } => {
+                    let tracks=prepared.ok_or_else(||RpcError::new(2,"Missing prepared playlist"))?;
+                    if tracks.is_empty() {return Err(RpcError::new(2,"Playlist is empty"));}
+                    if tracks.len()>MAX_QUEUE {return Err(RpcError::new(2,format!("Playlist has {} tracks; playback queue supports at most {MAX_QUEUE}. Current queue retained.",tracks.len())));}
+                    let mut candidate=self.state.clone();
+                    candidate.queue=tracks.into_iter().map(|track|QueueEntry{id:Uuid::new_v4(),track}).collect();
+                    let index=if candidate.mode==PlaybackMode::Shuffle {rand::random_range(0..candidate.queue.len())} else {0};
+                    candidate.current=Some(candidate.queue[index].id);
+                    candidate.position=0.0;
+                    candidate.duration=None;
+                    candidate.error=None;
+                    if serde_json::to_vec(&candidate).map_err(|e|RpcError::new(1,e.to_string()))?.len()>MAX_RESPONSE_FRAME-4096 {return Err(RpcError::new(2,"Playlist exceeds IPC snapshot size limit. Current queue retained."));}
+                    self.state=candidate;
+                    queue_changed=true;
+                    self.start_current(0.0).await?;
+                }
                 AppCommand::Play { .. } | AppCommand::QueueAdd { .. } => {
                     if self.state.queue.len() >= MAX_QUEUE {
-                        return Err(RpcError::new(2, "S1 queue limit is 500 entries"));
+                        return Err(RpcError::new(2, format!("Queue limit is {MAX_QUEUE} entries")));
                     }
                     let entry = QueueEntry {
                         id: Uuid::new_v4(),
-                        track: prepared
+                        track: prepared.and_then(|mut tracks| tracks.pop())
                             .ok_or_else(|| RpcError::new(2, "Missing prepared track metadata"))?,
                     };
                     let id = entry.id;
                     self.state.queue.push(entry);
+                    if !play && let Some(pending)=&self.pending && pending.replaced {
+                        let mut rollback=pending.before.clone();
+                        rollback.queue.extend(self.state.queue.iter().filter(|entry|!pending.added.contains(&entry.id)).cloned());
+                        if rollback.queue.len()>MAX_QUEUE || serde_json::to_vec(&rollback).map_err(|error|RpcError::new(1,error.to_string()))?.len()>MAX_RESPONSE_FRAME-4096 {
+                            self.state=before.clone();
+                            return Err(RpcError::new(2,"Queue addition exceeds capacity while playlist playback is loading"));
+                        }
+                    }
                     if serde_json::to_vec(&self.state)
                         .map_err(|e| RpcError::new(1, e.to_string()))?
                         .len()
-                        > MAX_FRAME - 4096
+                        > MAX_RESPONSE_FRAME - 4096
                     {
                         self.state = before.clone();
                         return Err(RpcError::new(2, "Queue exceeds IPC snapshot size limit"));

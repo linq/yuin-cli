@@ -355,3 +355,49 @@ pub(super) fn collection(r: &Value, p: Platform, chart: bool) -> Option<Collecti
         chart,
     })
 }
+
+pub(super) fn searched_collection(r: &Value, p: Platform) -> Option<Collection> {
+    let (id, title, subtitle, artwork) = match p {
+        Platform::Wy => (
+            string(r, &["id"]),
+            string(r, &["name"]),
+            string(&r["creator"], &["nickname"]),
+            string(r, &["coverImgUrl"]),
+        ),
+        Platform::Kw => (
+            string(r, &["playlistid"]),
+            string(r, &["name"]),
+            string(r, &["nickname"]),
+            string(r, &["pic"]),
+        ),
+        Platform::Kg => (
+            string(r, &["specialid"]),
+            string(r, &["specialname"]),
+            string(r, &["nickname"]),
+            string(r, &["imgurl"]).replace("{size}", "400"),
+        ),
+        Platform::Tx => (
+            string(r, &["dissid"]),
+            string(r, &["dissname"]),
+            string(&r["creator"], &["name"]),
+            string(r, &["imgurl"]),
+        ),
+        Platform::Mg => (
+            string(r, &["id"]),
+            string(r, &["name"]),
+            string(r, &["userName"]),
+            string(r, &["musicListPicUrl"]),
+        ),
+    };
+    if id.is_empty() || title.is_empty() {
+        return None;
+    }
+    Some(Collection {
+        id: format!("{p}:{id}"),
+        title: clean(&title),
+        subtitle: clean(&subtitle),
+        artwork: (!artwork.is_empty()).then_some(artwork),
+        platform: p,
+        chart: false,
+    })
+}

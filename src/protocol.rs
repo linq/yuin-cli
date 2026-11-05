@@ -5,8 +5,11 @@ use uuid::Uuid;
 use crate::domain::Snapshot;
 
 pub const VERSION: u32 = 1;
+// Keep requests and source-worker messages small; full playlist snapshots need
+// an independent budget instead of the original S1 queue's 1 MiB transport cap.
 pub const MAX_FRAME: usize = 1024 * 1024;
-pub const MAX_QUEUE: usize = 500;
+pub const MAX_RESPONSE_FRAME: usize = 16 * 1024 * 1024;
+pub const MAX_QUEUE: usize = 10_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Request {
@@ -44,6 +47,13 @@ pub enum AppCommand {
     Subscribe,
     Play {
         path: String,
+    },
+    PlayCollection {
+        id: String,
+        chart: bool,
+    },
+    PlayLibrary {
+        id: Uuid,
     },
     PlayEntry {
         id: Uuid,
@@ -123,10 +133,26 @@ pub async fn read_frame(
     read_frame_buffered(reader, &mut frame).await
 }
 
+pub async fn read_frame_with_limit(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    limit: usize,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let mut frame = Vec::new();
+    read_frame_buffered_with_limit(reader, &mut frame, limit).await
+}
+
 // Persist the partial frame when a select! branch cancels a subscription read.
 pub async fn read_frame_buffered(
     reader: &mut (impl AsyncBufRead + Unpin),
     frame: &mut Vec<u8>,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    read_frame_buffered_with_limit(reader, frame, MAX_FRAME).await
+}
+
+pub async fn read_frame_buffered_with_limit(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    frame: &mut Vec<u8>,
+    limit: usize,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     loop {
         let available = reader.fill_buf().await?;
@@ -136,7 +162,11 @@ pub async fn read_frame_buffered(
         }
         let end = available.iter().position(|byte| *byte == b'\n');
         let count = end.map_or(available.len(), |n| n + 1);
-        anyhow::ensure!(frame.len() + count <= MAX_FRAME, "JSON frame exceeds 1 MiB");
+        anyhow::ensure!(
+            frame.len() + count <= limit,
+            "JSON frame exceeds {} MiB",
+            limit / (1024 * 1024)
+        );
         frame.extend_from_slice(&available[..count]);
         reader.consume(count);
         if end.is_some() {

@@ -94,7 +94,13 @@ impl Catalog {
             .map_err(|_| anyhow::anyhow!("Platform network request failed"))?;
         let bytes = crate::http::bytes(response, 30_000_000).await?;
         let text = String::from_utf8_lossy(&bytes);
-        serde_json::from_str(&text).context("Platform returned invalid JSON")
+        match serde_json::from_str(&text) {
+            Ok(value) => Ok(value),
+            Err(_) if endpoint == "https://search.kuwo.cn/r.s" => {
+                json5::from_str(&text).context("Platform returned invalid JSON")
+            }
+            Err(error) => Err(error).context("Platform returned invalid JSON"),
+        }
     }
 
     pub async fn search(
@@ -231,6 +237,154 @@ impl Catalog {
             .iter()
             .filter_map(|r| track(r, platform))
             .filter(|t| seen.insert(t.id.clone()))
+            .collect();
+        Ok(CollectionPage::new(items, total, page, size as usize))
+    }
+
+    pub async fn search_collections(
+        &self,
+        query: &str,
+        platform: Platform,
+        page: u32,
+    ) -> Result<CollectionPage<Collection>> {
+        ensure!(
+            (1..=1000).contains(&page),
+            "Page must be between 1 and 1000"
+        );
+        ensure!(
+            !query.trim().is_empty() && query.len() <= 1024,
+            "Search requires 1–1024 bytes"
+        );
+        let size = 30_u32;
+        let (rows, total) = match platform {
+            Platform::Wy => {
+                let d = self
+                    .request(
+                        "https://music.163.com/api/search/get",
+                        &[
+                            ("s", query.into()),
+                            ("type", "1000".into()),
+                            ("limit", size.to_string()),
+                            ("offset", ((page - 1) * size).to_string()),
+                        ],
+                        None,
+                        false,
+                        &[],
+                    )
+                    .await?;
+                ensure!(
+                    d["code"] == 200 && d["result"].is_object(),
+                    "NetEase playlist search unavailable"
+                );
+                (
+                    array(&d["result"], &["playlists"]),
+                    number(&d["result"], &["playlistCount"]) as usize,
+                )
+            }
+            Platform::Kw => {
+                let d = self
+                    .request(
+                        "https://search.kuwo.cn/r.s",
+                        &[
+                            ("all", query.into()),
+                            ("pn", (page - 1).to_string()),
+                            ("rn", size.to_string()),
+                            ("rformat", "json".into()),
+                            ("encoding", "utf8".into()),
+                            ("ver", "mbox".into()),
+                            ("vipver", "MUSIC_8.7.7.0_BCS37".into()),
+                            ("plat", "pc".into()),
+                            ("devid", "28156413".into()),
+                            ("ft", "playlist".into()),
+                            ("pay", "0".into()),
+                            ("needliveshow", "0".into()),
+                        ],
+                        None,
+                        false,
+                        &[],
+                    )
+                    .await?;
+                ensure!(!d["TOTAL"].is_null(), "Kuwo playlist search unavailable");
+                (array(&d, &["abslist"]), number(&d, &["TOTAL"]) as usize)
+            }
+            Platform::Kg => {
+                let d = self
+                    .request(
+                        "https://msearchretry.kugou.com/api/v3/search/special",
+                        &[
+                            ("keyword", query.into()),
+                            ("page", page.to_string()),
+                            ("pagesize", size.to_string()),
+                            ("showtype", "10".into()),
+                            ("filter", "0".into()),
+                            ("version", "7910".into()),
+                            ("sver", "2".into()),
+                        ],
+                        None,
+                        false,
+                        &[],
+                    )
+                    .await?;
+                ensure!(
+                    d["errcode"] == 0 && d["data"].is_object(),
+                    "Kugou playlist search unavailable"
+                );
+                (
+                    array(&d["data"], &["info"]),
+                    number(&d["data"], &["total"]) as usize,
+                )
+            }
+            Platform::Tx => {
+                let d = self
+                    .request(
+                        "https://c.y.qq.com/soso/fcgi-bin/client_music_search_songlist",
+                        &[
+                            ("query", query.into()),
+                            ("page_no", (page - 1).to_string()),
+                            ("num_per_page", size.to_string()),
+                            ("format", "json".into()),
+                            ("remoteplace", "txt.yqq.playlist".into()),
+                            ("inCharset", "utf8".into()),
+                            ("outCharset", "utf-8".into()),
+                        ],
+                        None,
+                        false,
+                        &[("Referer", "https://y.qq.com/portal/search.html".into())],
+                    )
+                    .await?;
+                ensure!(
+                    d["code"] == 0 && d["data"].is_object(),
+                    "QQ playlist search unavailable"
+                );
+                (
+                    array(&d["data"], &["list"]),
+                    number(&d["data"], &["sum"]) as usize,
+                )
+            }
+            Platform::Mg => {
+                use md5::Md5;
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_millis()
+                    .to_string();
+                let device = "963B7AA0D21511ED807EE5846EC87D20";
+                let sign=Md5::digest(format!("{query}6cdc72a439cef99a3418d2a78aa28c73yyapp2d16148780a1dcc7408e06336b98cfd50{device}{stamp}").as_bytes()).iter().map(|b|format!("{b:02x}")).collect::<String>();
+                let d=self.request("https://jadeite.migu.cn/music_search/v3/search/searchAll", &[("text",query.into()),("pageNo",page.to_string()),("pageSize",size.to_string()),("isCorrect","1".into()),("isCopyright","1".into()),("sort","0".into()),("sid","USS".into()),("searchSwitch",r#"{"song":0,"album":0,"singer":0,"tagSong":0,"mvSong":0,"bestShow":0,"songlist":1,"lyricSong":0}"#.into())],None,false,&[("uiVersion","A_music_3.6.1".into()),("deviceId",device.into()),("timestamp",stamp),("sign",sign),("channel","0146921".into())]).await?;
+                ensure!(
+                    d["songListResultData"].is_object(),
+                    "Migu playlist search unavailable"
+                );
+                (
+                    array(&d["songListResultData"], &["result"]),
+                    number(&d["songListResultData"], &["totalCount"]) as usize,
+                )
+            }
+        };
+        let mut seen = HashSet::new();
+        let items = rows
+            .iter()
+            .filter_map(|r| parse::searched_collection(r, platform))
+            .filter(|r| seen.insert(r.id.clone()))
             .collect();
         Ok(CollectionPage::new(items, total, page, size as usize))
     }

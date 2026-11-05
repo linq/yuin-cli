@@ -29,7 +29,7 @@ impl Default for Config {
             download_dir: PathBuf::new(),
             download_concurrency: 2,
             language: "zh-CN".into(),
-            theme: "terminal".into(),
+            theme: "macchiato".into(),
             fade_seconds: 0.0,
             media_keys: false,
         }
@@ -69,8 +69,8 @@ impl Config {
             "language must be zh-CN or en"
         );
         ensure!(
-            ["terminal", "dark", "light"].contains(&self.theme.as_str()),
-            "theme must be terminal, dark or light"
+            ["macchiato", "terminal", "dark", "light"].contains(&self.theme.as_str()),
+            "theme must be macchiato, terminal, dark or light"
         );
         ensure!(
             self.download_dir.is_absolute(),

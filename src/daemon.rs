@@ -20,8 +20,8 @@ use crate::{
     domain::Snapshot,
     paths::AppPaths,
     protocol::{
-        AppCommand, AppEvent, MAX_FRAME, Request, Response, RpcError, VERSION, read_frame,
-        read_frame_buffered,
+        AppCommand, AppEvent, MAX_FRAME, MAX_RESPONSE_FRAME, Request, Response, RpcError, VERSION,
+        read_frame, read_frame_buffered_with_limit, read_frame_with_limit,
     },
     secure,
     storage::Storage,
@@ -45,11 +45,28 @@ async fn receive(
     reader: &mut BufReader<UnixStream>,
     request_id: uuid::Uuid,
 ) -> Result<serde_json::Value> {
-    let frame = timeout(RPC_TIMEOUT, read_frame(reader))
-        .await
-        .context("Daemon response timed out")??
-        .context("Daemon disconnected")?;
+    let frame = timeout(
+        RPC_TIMEOUT,
+        read_frame_with_limit(reader, MAX_RESPONSE_FRAME),
+    )
+    .await
+    .context("Daemon response timed out")??
+    .context("Daemon disconnected")?;
     let response: Response = serde_json::from_slice(&frame).context("Invalid daemon response")?;
+    // A daemon predating a command rejects it during deserialization; older
+    // builds also lose the request ID. Explain how to upgrade, while rejecting
+    // unrelated responses with an incorrect non-nil ID.
+    if response.version == VERSION
+        && (response.request_id.is_nil() || response.request_id == request_id)
+        && response.error.as_ref().is_some_and(|error| {
+            error.code == 2 && error.message == "Invalid request JSON or method"
+        })
+    {
+        return Err(RpcError::new(
+            6,
+            "Background service cannot read this command. If Yuin was updated, run `yuin daemon stop`, then retry with the updated Yuin executable.",
+        ).into());
+    }
     ensure!(
         response.version == VERSION && response.request_id == request_id,
         "Daemon protocol mismatch"
@@ -82,9 +99,10 @@ impl Subscription {
     }
 
     pub async fn next(&mut self) -> Result<Snapshot> {
-        let frame = read_frame_buffered(&mut self.reader, &mut self.frame)
-            .await?
-            .context("Daemon disconnected; reconnect to restore the session")?;
+        let frame =
+            read_frame_buffered_with_limit(&mut self.reader, &mut self.frame, MAX_RESPONSE_FRAME)
+                .await?
+                .context("Daemon disconnected; reconnect to restore the session")?;
         let event: AppEvent = serde_json::from_slice(&frame)?;
         ensure!(
             event.version == VERSION && event.sequence == event.snapshot.sequence,
@@ -157,9 +175,28 @@ async fn send(
     writer: &mut (impl AsyncWriteExt + Unpin),
     value: &impl serde::Serialize,
 ) -> Result<()> {
+    send_with_limit(writer, value, MAX_FRAME).await
+}
+
+async fn send_response(
+    writer: &mut (impl AsyncWriteExt + Unpin),
+    value: &impl serde::Serialize,
+) -> Result<()> {
+    send_with_limit(writer, value, MAX_RESPONSE_FRAME).await
+}
+
+async fn send_with_limit(
+    writer: &mut (impl AsyncWriteExt + Unpin),
+    value: &impl serde::Serialize,
+    limit: usize,
+) -> Result<()> {
     let mut bytes = serde_json::to_vec(value)?;
     bytes.push(b'\n');
-    ensure!(bytes.len() <= MAX_FRAME, "IPC frame exceeds 1 MiB");
+    ensure!(
+        bytes.len() <= limit,
+        "IPC frame exceeds {} MiB",
+        limit / (1024 * 1024)
+    );
     timeout(Duration::from_secs(2), writer.write_all(&bytes)).await??;
     Ok(())
 }
@@ -276,11 +313,17 @@ async fn serve(
     let request: Request = match serde_json::from_slice(&frame) {
         Ok(request) => request,
         Err(_) => {
-            send(
+            // Even an unknown method/service can have a valid envelope. Keep
+            // its identity so clients can surface the actual rejection.
+            let request_id = serde_json::from_slice::<serde_json::Value>(&frame)
+                .ok()
+                .and_then(|value| value["request_id"].as_str().and_then(|id| id.parse().ok()))
+                .unwrap_or_else(uuid::Uuid::nil);
+            send_response(
                 &mut write,
                 &Response {
                     version: VERSION,
-                    request_id: uuid::Uuid::nil(),
+                    request_id,
                     result: None,
                     error: Some(RpcError::new(2, "Invalid request JSON or method")),
                 },
@@ -290,7 +333,7 @@ async fn serve(
         }
     };
     if request.version != VERSION {
-        send(
+        send_response(
             &mut write,
             &Response {
                 version: VERSION,
@@ -314,7 +357,7 @@ async fn serve(
                 (None, Some(RpcError::new(code, error.to_string())))
             }
         };
-        send(
+        send_response(
             &mut write,
             &Response {
                 version: VERSION,
@@ -330,12 +373,14 @@ async fn serve(
         if !matches!(
             *command,
             AppCommand::Play { .. }
+                | AppCommand::PlayCollection { .. }
+                | AppCommand::PlayLibrary { .. }
                 | AppCommand::PlayEntry { .. }
                 | AppCommand::Resume
                 | AppCommand::Next
                 | AppCommand::Previous
         ) {
-            send(
+            send_response(
                 &mut write,
                 &Response {
                     version: VERSION,
@@ -355,19 +400,24 @@ async fn serve(
     let readonly = subscribe || matches!(command, AppCommand::Snapshot);
     let (reply, mut result) = oneshot::channel();
     let dispatch = async {
-        let prepared = match &command {
+        let prepared_result = match &command {
             AppCommand::Play { path } | AppCommand::QueueAdd { path } => {
-                match services.track(path).await {
-                    Ok(track) => Some(track),
-                    Err(error) => {
-                        return Ok(Err(error
-                            .downcast_ref::<RpcError>()
-                            .cloned()
-                            .unwrap_or_else(|| RpcError::new(6, error.to_string()))));
-                    }
-                }
+                services.track(path).await.map(|track| Some(vec![track]))
             }
-            _ => None,
+            AppCommand::PlayCollection { id, chart } => {
+                services.collection_tracks(id, *chart).await.map(Some)
+            }
+            AppCommand::PlayLibrary { id } => services.library_tracks(*id).await.map(Some),
+            _ => Ok(None),
+        };
+        let prepared = match prepared_result {
+            Ok(value) => value,
+            Err(error) => {
+                return Ok(Err(error
+                    .downcast_ref::<RpcError>()
+                    .cloned()
+                    .unwrap_or_else(|| RpcError::new(6, error.to_string()))));
+            }
         };
         commands
             .send(Envelope {
@@ -396,7 +446,7 @@ async fn serve(
     };
     let mut sequence = snapshot.as_ref().map_or(0, |s| s.sequence);
     let success = error.is_none();
-    send(
+    send_response(
         &mut write,
         &Response {
             version: VERSION,
@@ -425,7 +475,7 @@ async fn serve(
             continue;
         }
         sequence = snapshot.sequence;
-        send(
+        send_response(
             &mut write,
             &AppEvent {
                 version: VERSION,

@@ -18,6 +18,6 @@ The optional `.pkg` installs the binary under `/usr/local/bin`, manual under `/u
 
 `yuin paths --json` reports application data and runtime locations. `yuin daemon stop` stops playback and child processes. Removing the executable does not remove the user's library, source snapshots or downloaded audio. Data deletion is an explicit user action. No desktop Yuin library is modified automatically.
 
-System media controls are optional: `yuin config set media_keys true`, then stop/restart the daemon. macOS requires the daemon's AppKit event loop; Linux requires a user D-Bus session. Themes are terminal/dark/light, language is en/zh-CN, and optional old-track fade is configured through `fade_seconds` (0–10, default 0).
+System media controls are optional: `yuin config set media_keys true`, then stop/restart the daemon. macOS requires the daemon's AppKit event loop; Linux requires a user D-Bus session. Themes are macchiato (default)/terminal/dark/light, language is en/zh-CN, and optional old-track fade is configured through `fade_seconds` (0–10, default 0).
 
 The package includes dependency SPDX information and the available upstream license/notice files. Third-party music-source scripts and downloaded audio are never included in release artifacts.

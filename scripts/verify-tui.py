@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Opt-in PTY check; uses isolated data and generated silent audio.
 
-Usage: python3 scripts/verify-tui.py target/release/yuin [--real-mpv]
+Usage: python3 scripts/verify-tui.py target/release/yuin [--real-mpv] [--large-playlist]
 Default mode uses tests/fixtures/mpv.py. --real-mpv uses mpv on PATH.
+--large-playlist checks 649 tracks and snapshots larger than 1 MiB.
 """
 import contextlib
 import http.server
@@ -23,11 +24,17 @@ import termios
 import time
 import wave
 import urllib.parse
+import zlib
 
 binary = str(Path(sys.argv[1]).resolve())
 real = "--real-mpv" in sys.argv[2:]
+playlist_size = 649 if '--large-playlist' in sys.argv[2:] else 2
 with tempfile.TemporaryDirectory(prefix="yuin-pty-") as directory:
-    env = {**os.environ, "YUIN_DATA_DIR": str(Path(directory) / "data"), "TERM": "xterm-256color"}
+    env = {**os.environ, "YUIN_DATA_DIR": str(Path(directory) / "data"), "TERM": "xterm-256color", "TERM_PROGRAM": "WezTerm", "COLORTERM": "truecolor"}
+    env.pop('NO_COLOR', None)
+    def png_chunk(kind, data):
+        return struct.pack('!I', len(data)) + kind + data + struct.pack('!I', zlib.crc32(kind + data))
+    png = b'\x89PNG\r\n\x1a\n' + png_chunk(b'IHDR', struct.pack('!IIBBBBB', 2, 2, 8, 6, 0, 0, 0)) + png_chunk(b'IDAT', zlib.compress((b'\x00' + b'\xff\x00\x00\xff' * 2) * 2)) + png_chunk(b'IEND', b'')
     class CatalogFixture(http.server.BaseHTTPRequestHandler):
         searches = []
         def log_message(self, *args):
@@ -35,8 +42,22 @@ with tempfile.TemporaryDirectory(prefix="yuin-pty-") as directory:
         def do_GET(self):
             parsed = urllib.parse.urlparse(self.path)
             if parsed.path == '/api/search/get':
-                type(self).searches.append(urllib.parse.parse_qs(parsed.query).get('s', [''])[0])
-                data = json.dumps({'code':200,'result':{'songs':[{'id':1,'name':'Search fixture','artists':[],'album':{},'duration':1000}],'songCount':1}}).encode()
+                query = urllib.parse.parse_qs(parsed.query)
+                kind = query.get('type', [''])[0]
+                type(self).searches.append((query.get('s', [''])[0], kind))
+                if kind == '1000':
+                    data = json.dumps({'code':200,'result':{'playlists':[{'id':10,'name':'Playlist fixture'}],'playlistCount':1}}).encode()
+                else:
+                    data = json.dumps({'code':200,'result':{'songs':[{'id':1,'name':'Search fixture','artists':[],'album':{'picUrl':f'http://127.0.0.1:{self.server.server_port}/cover.png'},'duration':1000}],'songCount':1}}).encode()
+            elif parsed.path == '/cover.png':
+                data = png
+            elif parsed.path == '/audio.wav':
+                data = audio.read_bytes()
+            elif parsed.path == '/api/v3/playlist/detail':
+                data = json.dumps({'code':200,'playlist':{'trackCount':playlist_size,'trackIds':[{'id':n} for n in range(1,playlist_size+1)]}}).encode()
+            elif parsed.path == '/api/v3/song/detail':
+                ids = json.loads(urllib.parse.parse_qs(parsed.query)['ids'][0])
+                data = json.dumps({'code':200,'songs':[{'id':n,'name':f'Playlist track {n}','ar':[],'al':{'id':8,'name':'海'*700 if playlist_size>2 else 'Album'},'dt':60000} for n in ids]}).encode()
             else:
                 data = b'{"code":200,"playlists":[],"list":[],"total":0}'
             self.send_response(200)
@@ -98,6 +119,10 @@ with tempfile.TemporaryDirectory(prefix="yuin-pty-") as directory:
 
     try:
         cli("config", "set", "language", "en")
+        source = Path(directory) / 'source.js'
+        source.write_text("/* @name PTY fixture */\nlx.on(lx.EVENT_NAMES.request,async()=>({url:'BASE/audio.wav'}));lx.send(lx.EVENT_NAMES.inited,{sources:{wy:{type:'music',actions:['musicUrl'],qualitys:['128k','320k']}}});".replace('BASE', f'http://127.0.0.1:{catalog.server_port}'))
+        source_id = cli('source', 'import', str(source))['source']['id']
+        cli('source', 'use', source_id)
         playing = cli("play", str(audio))
         child = subprocess.Popen([binary, "tui"], stdin=slave, stdout=slave, stderr=slave, env=env)
         read_until(b"leave")
@@ -109,13 +134,44 @@ with tempfile.TemporaryDirectory(prefix="yuin-pty-") as directory:
         # Verify changes made by an independent CLI process reach the live TUI.
         cli("volume", "37")
         read_until(b"37")
+        # Search playlists in the playlist page, then switch to song search.
+        os.write(master, b"/playlist\r")
+        read_until(b"Playlist fixture")
+        assert CatalogFixture.searches[-1] == ('playlist', '1000')
+        os.write(master, b'F')
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            pump(.05)
+            lists = cli('library', 'list')['items']
+            if lists:
+                break
+        assert len(lists) == 1 and lists[0]['count'] == playlist_size, lists
+        pump()
+        os.write(master, b'F')
+        pump(.3)
+        assert len(cli('library', 'list')['items']) == 1
+        os.write(master, b'b')
+        deadline = time.monotonic() + 10
+        expected_tracks = [f'wy:{n}' for n in range(1,playlist_size+1)]
+        while time.monotonic() < deadline:
+            pump(.05)
+            whole = cli('status')
+            if [e['track']['id'] for e in whole['queue']] == expected_tracks and whole['state'] == 'playing':
+                break
+        assert [e['track']['id'] for e in whole['queue']] == expected_tracks, whole
+        assert whole['current'] == whole['queue'][0]['id'] and whole['state'] == 'playing'
+        cli('queue', 'clear')
+        playing = cli('play', str(audio))
+        pump()
+        os.write(master, b"1")
+        read_until(b"Search")
         # Text input owns Space/j/k/q; they must not act as playback/navigation keys.
         os.write(master, b"/j k q")
         pump()
         assert child.poll() is None
         os.write(master, b"\r")
         read_until(b"fixture")
-        assert CatalogFixture.searches[-1] == 'j k q'
+        assert CatalogFixture.searches[-1] == ('j k q', '1')
         os.write(master, b"a")
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
@@ -124,6 +180,11 @@ with tempfile.TemporaryDirectory(prefix="yuin-pty-") as directory:
             if len(queue) == 2:
                 break
         assert queue[-1]["track"]["id"] == 'wy:1', queue
+        if not real:
+            cli('play', 'wy:1')
+            read_until(b'\x1b_Ga=T,f=100')
+            playing = cli('play', str(audio))
+            read_until(b'\x1b_Ga=d,d=I')
         os.write(master, b"3")
         read_until(b"Charts")
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 12, 60, 0, 0))
@@ -142,7 +203,7 @@ with tempfile.TemporaryDirectory(prefix="yuin-pty-") as directory:
         if real:
             time.sleep(0.3)
             assert cli("status")["position"] > after["position"]
-        print(f"PTY PASS ({'real mpv' if real else 'fixture'}): controls, cross-client updates, resize, clean exit, termios restore, playback survives TUI exit")
+        print(f"PTY PASS ({'real mpv' if real else 'fixture'}): {playlist_size}-track playlist F/b, controls, cross-client updates, resize, clean exit, termios restore, playback survives TUI exit")
     finally:
         if child and child.poll() is None:
             child.kill()

@@ -46,10 +46,15 @@ yuin daemon stop                         # 关闭后台服务及其子进程
 
 业务命令自动启动 daemon；查询恢复状态不会出声。doctor、paths、help、version、completions、man 不写应用数据或启动服务；daemon stop 不会启动 daemon。
 
+更新可执行文件后，已经运行的后台服务仍使用旧代码。若新增命令提示后台无法识别，请先用更新后的程序执行 `yuin daemon stop`，再重新打开 TUI 或重试命令；队列和播放位置会保存，重启后默认暂停。
+
 ## 列表、队列、下载
 
 ```sh
 yuin playlists list --platform wy
+yuin playlists search '周杰伦' --platform wy --page 1
+yuin playlists favorite wy:654321 --name '通勤歌单'
+yuin playlists play wy:654321
 yuin playlists show wy:654321 --page 2
 yuin charts list --platform kw
 yuin charts show kw:93 --all
@@ -58,6 +63,7 @@ yuin library add <列表UUID> wy:123456
 yuin library favorite wy:123456
 yuin library save wy:654321 '保存完整歌单'
 yuin library show <列表UUID> --page 2
+yuin library play <列表UUID>
 yuin library move <列表UUID> 0 3           # 从零开始的索引
 yuin library remove <列表UUID> 0
 yuin queue add wy:123456
@@ -81,11 +87,19 @@ yuin lyrics wy:123456
 
 播放会优先重新校验同一歌曲／音质的离线文件与 SHA-256。`source stop` 禁用音乐源后，已校验文件仍能播放。正常控制／退出保存状态，播放期间每五秒 checkpoint；强制终止可能丢失最后几秒进度。
 
-队列最多 500 项，并受 1 MiB 快照限制；个人列表最多 10,000 首，完整目录最多拉取 100 页。个人列表、下载与历史每页 100 项。推荐接口没有可信总数时返回 `total: null`，不伪造整站数量。顺序模式到末尾结束，错误需显式重试。
+队列最多 10,000 项，并受 16 MiB 快照限制；个人列表最多 10,000 首，完整目录最多拉取 100 页。个人列表、下载与历史每页 100 项。推荐接口没有可信总数时返回 `total: null`，不伪造整站数量。顺序模式到末尾结束，错误需显式重试。
+
+整单收藏会完整拉取分页并保存本地快照；重复收藏同一平台的同一歌单不会新增副本，也不会覆盖已经编辑的收藏。整单播放会在完整拉取成功后替换队列，保持歌单顺序并沿用当前播放模式；随机模式会随机选择首曲。空歌单、超过 10,000 首、内容截断或超出快照容量时会报错并保留原队列，不会只播放预览页。
 
 ## TUI 与配置
 
-默认歌单页。`/` 输入搜索；输入状态下 Space、j/k、q 都作为文本。Tab 切换导航／内容／队列焦点；方向键或 j/k 选择；1–5 切页；Enter 打开／播放；Backspace 返回并保留选中项与滚动；`]` 追加一页；a 入队；d 下载；f 收藏；x 取消选中下载；r 刷新；P 改默认平台；l 显示歌词；Space 暂停；n/p 切歌；左右定位；+/- 音量；s 停止；q、Esc 或 Ctrl+C 退出。小窗口可用 Tab 查看收起的队列。已接受的播放即使仍在加载，退出界面也会继续。
+默认歌单页。在歌单页按 `/` 搜索当前平台的歌单，在其他页面按 `/` 搜索歌曲；输入框中 Ctrl+U 清空，再按 Enter 可恢复推荐歌单。输入状态下 Space、j/k、q 都作为文本。Tab 切换导航／内容／队列焦点；方向键或 j/k 选择；1–5 切页；Enter 打开／播放；Backspace 返回并保留选中项与滚动；`]` 追加一页；a 入队；d 下载；f 收藏；x 取消选中下载；r 刷新；P 改默认平台；l 显示歌词；Space 暂停；n/p 切歌；左右定位；+/- 音量；s 停止；q、Esc 或 Ctrl+C 退出。小窗口可用 Tab 查看收起的队列。已接受的播放即使仍在加载，退出界面也会继续。
+
+默认采用 Catppuccin Macchiato 配色，包含深蓝灰背景、淡紫色选中行、蓝色交互提示和绿色播放状态；也可切换终端默认、深色或浅色主题。
+
+Ghostty、WezTerm 和 Kitty 在窗口宽高足够时显示当前歌曲封面；缺少封面、终端不支持或处于 tmux/screen 时显示文字界面。封面来自平台的公开元数据，获取失败不会影响播放。
+
+在歌单／排行榜列表或详情中按 **F（Shift+f）** 收藏整个歌单，按 **b** 播放整个歌单；“我的列表”中的歌单也可按 b 播放。小写 f 在歌曲详情中仍收藏单曲，在歌单列表中收藏选中的整个歌单。输入搜索文字时，这些按键只输入文字。
 
 ```sh
 yuin config get --json
@@ -94,7 +108,7 @@ yuin config set play_quality 320k
 yuin config set download_quality flac
 yuin config set download_dir '/绝对路径/下载'
 yuin config set download_concurrency 2
-yuin config set theme terminal            # terminal / dark / light
+yuin config set theme macchiato           # macchiato（默认）/ terminal / dark / light
 yuin config set language zh-CN            # zh-CN / en
 yuin config set fade_seconds 5            # 0–10，默认 0
 yuin config set media_keys true           # 设置后重启 daemon

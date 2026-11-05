@@ -40,6 +40,22 @@ impl ConfigCommand {
 
 #[derive(Subcommand)]
 pub enum CollectionCommand {
+    /// Replace the queue with the entire collection and start playback
+    Play { id: String },
+    /// Save a complete collection once in My Library
+    Favorite {
+        id: String,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Search online playlists by name
+    Search {
+        query: String,
+        #[arg(long)]
+        platform: Option<Platform>,
+        #[arg(long,default_value_t=1,value_parser=clap::value_parser!(u32).range(1..=1000))]
+        page: u32,
+    },
     List {
         #[arg(long)]
         platform: Option<Platform>,
@@ -55,8 +71,26 @@ pub enum CollectionCommand {
     },
 }
 impl CollectionCommand {
-    pub fn service(self, charts: bool) -> ServiceCommand {
-        match self {
+    pub fn service(self, charts: bool) -> anyhow::Result<ServiceCommand> {
+        Ok(match self {
+            Self::Play { .. } => anyhow::bail!("Playback command must use the player dispatcher"),
+            Self::Favorite { id, name } => ServiceCommand::LibraryFavorite {
+                name: name.unwrap_or_else(|| id.clone()),
+                collection: id,
+                chart: charts,
+            },
+            Self::Search {
+                query,
+                platform,
+                page,
+            } => {
+                anyhow::ensure!(!charts, "Search is available for playlists, not charts");
+                ServiceCommand::SearchCollections {
+                    query,
+                    platform,
+                    page,
+                }
+            }
             Self::List { platform, page } => ServiceCommand::Collections {
                 platform,
                 charts,
@@ -68,12 +102,16 @@ impl CollectionCommand {
                 page,
                 all,
             },
-        }
+        })
     }
 }
 
 #[derive(Subcommand)]
 pub enum LibraryCommand {
+    /// Replace the queue with this saved playlist and start playback
+    Play {
+        id: Uuid,
+    },
     Favorite {
         track: String,
     },
@@ -114,8 +152,9 @@ pub enum LibraryCommand {
     },
 }
 impl LibraryCommand {
-    pub fn service(self) -> ServiceCommand {
-        match self {
+    pub fn service(self) -> anyhow::Result<ServiceCommand> {
+        Ok(match self {
+            Self::Play { .. } => anyhow::bail!("Playback command must use the player dispatcher"),
             Self::Favorite { track } => ServiceCommand::Favorite { track },
             Self::List => ServiceCommand::LibraryList,
             Self::Create { name } => ServiceCommand::LibraryCreate { name },
@@ -134,7 +173,7 @@ impl LibraryCommand {
             Self::Remove { id, index } => ServiceCommand::LibraryRemove { id, index },
             Self::Move { id, from, to } => ServiceCommand::LibraryMove { id, from, to },
             Self::Delete { id } => ServiceCommand::LibraryDelete { id },
-        }
+        })
     }
 }
 

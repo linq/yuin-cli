@@ -1,8 +1,10 @@
 mod browser;
+mod cover;
+mod theme;
 use crate::{
     config::Config,
     daemon::{self, Subscription},
-    domain::{Platform, PlaybackState, Snapshot},
+    domain::{Platform, PlaybackState, Snapshot, Track},
     protocol::AppCommand,
     services::ServiceCommand,
 };
@@ -11,8 +13,9 @@ use browser::Browser;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout},
-    style::{Color, Style},
+    layout::{Constraint, Layout, Rect},
+    style::{Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, List, ListItem, ListState, Paragraph},
 };
 use serde_json::Value;
@@ -21,6 +24,7 @@ use std::{
     io::{self, IsTerminal},
     time::Duration,
 };
+use theme::Theme;
 use tokio::{sync::mpsc, task::JoinSet};
 
 const EN: [&str; 5] = ["Search", "Playlists", "Charts", "My Library", "Downloads"];
@@ -35,9 +39,17 @@ enum Update {
     },
     Config(Config),
     Message(String),
+    SavedPlaylist {
+        count: usize,
+        already: bool,
+    },
     Lyrics {
         track: String,
         document: crate::lyrics::Lyrics,
+    },
+    Cover {
+        key: String,
+        png: Option<Vec<u8>>,
     },
 }
 enum Action {
@@ -49,6 +61,10 @@ enum Action {
     },
     Service(ServiceCommand),
     Lyrics(String),
+    Cover {
+        key: String,
+        track: Track,
+    },
 }
 
 pub async fn run() -> Result<()> {
@@ -83,8 +99,12 @@ pub async fn run() -> Result<()> {
                             if let Some(previous)=queries.remove(&99){previous.abort();}
                             let handle=jobs.spawn(async move{match daemon::call_value(AppCommand::Service{command:ServiceCommand::Lyrics{track:track.clone(),refresh:false}},false).await.and_then(|v|serde_json::from_value::<crate::lyrics::Lyrics>(v["lyrics"].clone()).map_err(Into::into)){Ok(document)=>Update::Lyrics{track,document},Err(error)=>Update::Error(error.to_string())}});queries.insert(99,handle);
                         }
-                        Action::Control(command)=>{let command=if matches!(command,AppCommand::Play{..}|AppCommand::PlayEntry{..}|AppCommand::Resume|AppCommand::Next|AppCommand::Previous){AppCommand::Detached{command:Box::new(command)}}else{command};jobs.spawn(async move{match daemon::call(command,false).await{Ok(snapshot)=>Update::Snapshot(snapshot),Err(error)=>Update::Error(error.to_string())}});},
-                        Action::Service(command)=>{jobs.spawn(async move{match daemon::call_value(AppCommand::Service{command},false).await{Ok(value)=>if value["config"].is_object(){match serde_json::from_value(value["config"].clone()){Ok(config)=>Update::Config(config),Err(error)=>Update::Error(error.to_string())}}else{Update::Message("Done".into())},Err(error)=>Update::Error(error.to_string())}});},
+                        Action::Cover{key,track}=>{
+                            if let Some(previous)=queries.remove(&98){previous.abort();}
+                            let handle=jobs.spawn(async move { let png=cover::fetch(track).await.ok(); Update::Cover{key,png} }); queries.insert(98,handle);
+                        }
+                        Action::Control(command)=>{let command=if matches!(command,AppCommand::Play{..}|AppCommand::PlayEntry{..}|AppCommand::PlayCollection{..}|AppCommand::PlayLibrary{..}|AppCommand::Resume|AppCommand::Next|AppCommand::Previous){AppCommand::Detached{command:Box::new(command)}}else{command};jobs.spawn(async move{match daemon::call(command,false).await{Ok(snapshot)=>Update::Snapshot(snapshot),Err(error)=>Update::Error(error.to_string())}});},
+                        Action::Service(command)=>{jobs.spawn(async move{match daemon::call_value(AppCommand::Service{command},false).await{Ok(value)=>if value["config"].is_object(){match serde_json::from_value(value["config"].clone()){Ok(config)=>Update::Config(config),Err(error)=>Update::Error(error.to_string())}}else if let Some(count)=value["playlist"]["count"].as_u64(){Update::SavedPlaylist{count:count as usize,already:value["already_saved"]==true}}else{Update::Message("Done".into())},Err(error)=>Update::Error(error.to_string())}});},
                         Action::Query{index,version,command}=>{
                             if let Some(previous)=queries.remove(&index){previous.abort();}
                             let handle=jobs.spawn(async move{let result=daemon::call_value(AppCommand::Service{command},false).await.map_err(|e|e.to_string());Update::Query{index,version,result}});queries.insert(index,handle);
@@ -115,11 +135,17 @@ pub async fn run() -> Result<()> {
         message: String::new(),
         browser: Browser::new(config.platform, config.language == "en"),
         config,
+        cover_supported: cover::supported(),
+        cover_key: None,
+        cover_png: None,
+        cover_area: None,
     };
     view.refresh(&actions, false);
+    view.request_cover(&actions);
     let result = tokio::task::spawn_blocking(move || {
         ratatui::run(|terminal| -> io::Result<()> {
             let mut dirty = true;
+            let mut cover_renderer = cover::Renderer::new();
             let mut refresh_at = std::time::Instant::now();
             loop {
                 while let Ok(update) = update_rx.try_recv() {
@@ -146,6 +172,7 @@ pub async fn run() -> Result<()> {
                                 });
                             view.queue.select(index);
                             view.snapshot = snapshot;
+                            view.request_cover(&actions);
                             if view.lyrics_mode {
                                 view.request_lyrics(&actions);
                             }
@@ -183,6 +210,32 @@ pub async fn run() -> Result<()> {
                                 view.lyrics = Some(document);
                             }
                         }
+                        Update::Cover { key, png } => {
+                            if view.cover_key.as_deref() == Some(&key) {
+                                view.cover_png = png;
+                            }
+                        }
+                        Update::SavedPlaylist { count, already } => {
+                            view.message = if view.browser.english {
+                                format!(
+                                    "{} · {count} tracks",
+                                    if already {
+                                        "Playlist already saved"
+                                    } else {
+                                        "Playlist saved"
+                                    }
+                                )
+                            } else {
+                                format!(
+                                    "{} · {count} 首",
+                                    if already {
+                                        "已收藏该歌单"
+                                    } else {
+                                        "已收藏歌单"
+                                    }
+                                )
+                            };
+                        }
                         Update::Error(error) | Update::Message(error) => view.message = error,
                     }
                     dirty = true;
@@ -199,6 +252,11 @@ pub async fn run() -> Result<()> {
                 }
                 if dirty {
                     terminal.draw(|frame| draw(frame, &mut view))?;
+                    cover_renderer.draw(
+                        view.cover_area,
+                        view.cover_key.as_deref(),
+                        view.cover_png.as_deref(),
+                    )?;
                     dirty = false;
                 }
                 if !event::poll(Duration::from_millis(80))? {
@@ -207,6 +265,7 @@ pub async fn run() -> Result<()> {
                 let key = match event::read()? {
                     Event::Key(key) if key.is_press() => key,
                     Event::Resize(_, _) => {
+                        cover_renderer.draw(None, None, None)?;
                         dirty = true;
                         continue;
                     }
@@ -221,13 +280,20 @@ pub async fn run() -> Result<()> {
                         KeyCode::Enter => {
                             let query = input.clone();
                             view.browser.input = None;
-                            view.page = 0;
+                            let search_page = if view.page == 1 { 1 } else { 0 };
+                            if search_page == 1 {
+                                while view.browser.back(1) {}
+                            }
+                            view.page = search_page;
                             view.focus = 1;
-                            view.browser.routes[0].query = query;
+                            view.browser.routes[search_page].query = query;
                             view.refresh(&actions, false);
                         }
                         KeyCode::Backspace => {
                             input.pop();
+                        }
+                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            input.clear()
                         }
                         KeyCode::Char(c) => input.push(c),
                         _ => {}
@@ -241,7 +307,8 @@ pub async fn run() -> Result<()> {
                     KeyCode::Tab => view.focus = (view.focus + 1) % 3,
                     KeyCode::BackTab => view.focus = (view.focus + 2) % 3,
                     KeyCode::Char('/') => {
-                        view.browser.input = Some(view.browser.routes[0].query.clone());
+                        let search_page = if view.page == 1 { 1 } else { 0 };
+                        view.browser.input = Some(view.browser.routes[search_page].query.clone());
                     }
                     KeyCode::Char(number @ '1'..='5') => {
                         view.page = number as usize - '1' as usize;
@@ -305,12 +372,48 @@ pub async fn run() -> Result<()> {
                             command = Some(AppCommand::QueueAdd { path: id });
                         }
                     }
+                    KeyCode::Char('F' | 'f')
+                        if key.code == KeyCode::Char('F')
+                            || key.modifiers.contains(KeyModifiers::SHIFT) =>
+                    {
+                        if let Some(command) = view.browser.playlist_favorite(view.page) {
+                            view.send(&actions, Action::Service(command));
+                        } else {
+                            view.message = if view.browser.playlist_play(view.page).is_some() {
+                                if view.browser.english {
+                                    "This playlist is already in My Library"
+                                } else {
+                                    "该歌单已在我的列表中"
+                                }
+                            } else if view.browser.english {
+                                "Select or open a playlist first"
+                            } else {
+                                "请先选中或打开一个歌单"
+                            }
+                            .into();
+                        }
+                    }
                     KeyCode::Char('f') => {
                         if let Some(track) = view.browser.track_id(view.page) {
                             view.send(
                                 &actions,
                                 Action::Service(ServiceCommand::Favorite { track }),
                             );
+                        } else if let Some(command) = view.browser.playlist_favorite(view.page) {
+                            view.send(&actions, Action::Service(command));
+                        }
+                    }
+                    KeyCode::Char('b') => {
+                        command = view.browser.playlist_play(view.page);
+                        if command.is_some() {
+                            view.focus = 1;
+                        } else {
+                            view.message = if view.browser.english {
+                                "Select or open a playlist first"
+                            } else {
+                                "请先选中或打开一个歌单"
+                            }
+                            .into();
                         }
                     }
                     KeyCode::Char('d') => {
@@ -399,8 +502,34 @@ struct View {
     message: String,
     browser: Browser,
     config: Config,
+    cover_supported: bool,
+    cover_key: Option<String>,
+    cover_png: Option<Vec<u8>>,
+    cover_area: Option<Rect>,
 }
 impl View {
+    fn request_cover(&mut self, actions: &mpsc::Sender<Action>) {
+        if !self.cover_supported {
+            return;
+        }
+        let track = self
+            .snapshot
+            .current_entry()
+            .map(|entry| entry.track.clone());
+        let key = track
+            .as_ref()
+            .map(|track| format!("{}:{}", track.id, track.artwork.as_deref().unwrap_or("")));
+        if key == self.cover_key {
+            return;
+        }
+        self.cover_key = key.clone();
+        self.cover_png = None;
+        if let (Some(key), Some(track)) = (key, track)
+            && actions.try_send(Action::Cover { key, track }).is_err()
+        {
+            self.cover_key = None;
+        }
+    }
     fn request_lyrics(&mut self, actions: &mpsc::Sender<Action>) {
         let current = self.snapshot.current_entry().map(|e| e.track.id.clone());
         if current != self.lyric_track {
@@ -464,14 +593,10 @@ impl View {
     }
 }
 fn draw(frame: &mut Frame, view: &mut View) {
+    view.cover_area = None;
     let english = view.browser.english;
-    let accent = Color::Rgb(255, 45, 85);
-    let style = match view.config.theme.as_str() {
-        "dark" => Style::default().fg(Color::White).bg(Color::Black),
-        "light" => Style::default().fg(Color::Black).bg(Color::White),
-        _ => Style::default(),
-    };
-    frame.render_widget(Block::new().style(style), frame.area());
+    let theme = Theme::named(&view.config.theme);
+    frame.render_widget(Block::new().style(theme.base()), frame.area());
     let rows = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(2),
@@ -489,8 +614,14 @@ fn draw(frame: &mut Frame, view: &mut View) {
             view.browser.platform,
             if english { "Source" } else { "音乐源" }
         ))
-        .style(Style::default().fg(accent))
-        .block(Block::bordered()),
+        .style(
+            theme
+                .base()
+                .fg(theme.secondary)
+                .bg(theme.panel)
+                .add_modifier(Modifier::BOLD),
+        )
+        .block(theme.block("", false).style(theme.base().bg(theme.panel))),
         rows[0],
     );
     let columns = Layout::horizontal([
@@ -505,13 +636,18 @@ fn draw(frame: &mut Frame, view: &mut View) {
         .map(|(i, title)| ListItem::new(format!("{} {title}", i + 1)));
     frame.render_stateful_widget(
         List::new(items)
-            .block(Block::bordered().title(if english { "Browse" } else { "浏览" }))
-            .highlight_style(Style::default().fg(accent))
+            .style(theme.base().bg(theme.panel).fg(theme.muted))
+            .block(
+                theme
+                    .block(if english { "Browse" } else { "浏览" }, view.focus == 0)
+                    .style(theme.base().bg(theme.panel)),
+            )
+            .highlight_style(theme.selected(view.focus == 0))
             .highlight_symbol(if view.focus == 0 { "› " } else { "  " }),
         columns[0],
         &mut ListState::default().with_selected(Some(view.page)),
     );
-    let (content, queue) = if frame.area().width >= 100 {
+    let (mut content, queue) = if frame.area().width >= 100 {
         let split =
             Layout::horizontal([Constraint::Min(20), Constraint::Length(30)]).split(columns[1]);
         (Some(split[0]), Some(split[1]))
@@ -520,14 +656,33 @@ fn draw(frame: &mut Frame, view: &mut View) {
     } else {
         (Some(columns[1]), None)
     };
+    if queue.is_none()
+        && view.cover_supported
+        && let Some(area) = content
+        && area.width >= 44
+        && area.height >= 16
+    {
+        let split = Layout::horizontal([Constraint::Min(20), Constraint::Length(24)]).split(area);
+        content = Some(split[0]);
+        draw_cover(
+            frame,
+            view,
+            Rect::new(split[1].x, split[1].y, split[1].width, 14),
+        );
+    }
     if let Some(area) = content {
         if view.lyrics_mode {
             if let Some(lyrics) = &view.lyrics {
                 if lyrics.lines.is_empty() {
                     frame.render_widget(
-                        Paragraph::new(lyrics.plain.clone()).block(
-                            Block::bordered().title(if english { "Lyrics" } else { "歌词" }),
-                        ),
+                        Paragraph::new(lyrics.plain.clone())
+                            .style(theme.base())
+                            .block(
+                                theme.block(
+                                    if english { "Lyrics" } else { "歌词" },
+                                    view.focus == 1,
+                                ),
+                            ),
                         area,
                     );
                 } else {
@@ -544,12 +699,14 @@ fn draw(frame: &mut Frame, view: &mut View) {
                     });
                     frame.render_stateful_widget(
                         List::new(items)
-                            .block(Block::bordered().title(if english {
-                                "Lyrics"
-                            } else {
-                                "歌词"
-                            }))
-                            .highlight_style(Style::default().fg(accent)),
+                            .style(theme.subdued())
+                            .block(
+                                theme.block(
+                                    if english { "Lyrics" } else { "歌词" },
+                                    view.focus == 1,
+                                ),
+                            )
+                            .highlight_style(theme.selected(true).fg(theme.success)),
                         area,
                         &mut ListState::default().with_selected(active),
                     );
@@ -561,31 +718,40 @@ fn draw(frame: &mut Frame, view: &mut View) {
                     } else {
                         "正在加载歌词…"
                     })
-                    .block(Block::bordered()),
+                    .style(theme.subdued())
+                    .block(theme.block(if english { "Lyrics" } else { "歌词" }, view.focus == 1)),
                     area,
                 );
             }
         } else {
             view.browser
-                .draw(frame, area, view.page, view.focus == 1, accent);
+                .draw(frame, area, view.page, view.focus == 1, theme);
         }
     }
-    if let Some(area) = queue {
+    if let Some(mut area) = queue {
+        if view.cover_supported && area.width >= 24 && area.height >= 18 {
+            let split = Layout::vertical([Constraint::Length(14), Constraint::Min(4)]).split(area);
+            draw_cover(frame, view, split[0]);
+            area = split[1];
+        }
         let items = view.snapshot.queue.iter().map(|e| {
-            ListItem::new(format!(
-                "{} {}",
-                if view.snapshot.current == Some(e.id) {
-                    "▶"
-                } else {
-                    " "
-                },
-                e.track.title
-            ))
+            let current = view.snapshot.current == Some(e.id);
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    if current { "▶ " } else { "  " },
+                    Style::default().fg(theme.success),
+                ),
+                Span::styled(
+                    e.track.title.clone(),
+                    Style::default().fg(if current { theme.success } else { theme.text }),
+                ),
+            ]))
         });
         frame.render_stateful_widget(
             List::new(items)
-                .block(Block::bordered().title(if english { "Queue" } else { "队列" }))
-                .highlight_style(Style::default().fg(accent))
+                .style(theme.base())
+                .block(theme.block(if english { "Queue" } else { "队列" }, view.focus == 2))
+                .highlight_style(theme.selected(view.focus == 2))
                 .highlight_symbol("› "),
             area,
             &mut view.queue,
@@ -633,32 +799,116 @@ fn draw(frame: &mut Frame, view: &mut View) {
         .snapshot
         .duration
         .map_or("—".into(), |n| format!("{n:.0}s"));
+    let state_color = match view.snapshot.state {
+        PlaybackState::Playing => theme.success,
+        PlaybackState::Paused => theme.warning,
+        PlaybackState::Resolving | PlaybackState::Buffering => theme.secondary,
+        PlaybackState::Error => theme.error,
+        _ => theme.muted,
+    };
     frame.render_widget(
-        Paragraph::new(format!(
-            " {title} | {state} {:.0}s / {duration} | {} {}% · {mode}",
-            view.snapshot.position,
-            if english { "Volume" } else { "音量" },
-            view.snapshot.volume
-        ))
-        .block(Block::bordered()),
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!(" {title}"),
+                Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" | ", Style::default().fg(theme.border)),
+            Span::styled(state, Style::default().fg(state_color)),
+            Span::styled(
+                format!(" {:.0}s / {duration}", view.snapshot.position),
+                Style::default().fg(theme.muted),
+            ),
+            Span::styled(" | ", Style::default().fg(theme.border)),
+            Span::styled(
+                format!(
+                    "{} {}%",
+                    if english { "Volume" } else { "音量" },
+                    view.snapshot.volume
+                ),
+                Style::default().fg(theme.secondary),
+            ),
+            Span::styled(format!(" · {mode}"), Style::default().fg(theme.accent)),
+        ]))
+        .style(theme.base().bg(theme.panel))
+        .block(
+            theme
+                .block(if english { "Player" } else { "播放" }, false)
+                .style(theme.base().bg(theme.panel)),
+        ),
         rows[2],
     );
     if let Some(input) = &view.browser.input {
         frame.render_widget(
-            Paragraph::new(format!(" / {input}")).block(Block::bordered().title(if english {
-                "Search · Enter to submit · Esc to cancel"
-            } else {
-                "搜索 · Enter 提交 · Esc 取消"
-            })),
+            Paragraph::new(format!(" / {input}"))
+                .style(theme.base())
+                .block(
+                    theme
+                        .block(
+                            if english {
+                                "Search · Enter to submit · Esc to cancel"
+                            } else {
+                                "搜索 · Enter 提交 · Esc 取消"
+                            },
+                            true,
+                        )
+                        .border_style(Style::default().fg(theme.secondary)),
+                ),
             rows[3],
         );
     } else {
         let keys = if english {
-            " q: leave  /: search  Tab: focus  Enter: open/play  ]: more  a: queue  d: download  f: favorite  P: platform  Space: pause"
+            " q: leave  b: play playlist  F: save playlist  /: search  Tab: focus  Enter: open/play  ]: more  a: queue  f: favorite"
         } else {
-            " q 退出  / 搜索  Tab 焦点  Enter 打开/播放  ] 更多  a 入队  d 下载  f 收藏  P 平台  Space 暂停"
+            " q 退出  b 整单播放  F 整单收藏  / 搜索  Tab 焦点  Enter 打开/播放  ] 更多  a 入队  f 收藏"
         };
         let message = view.snapshot.error.as_deref().unwrap_or(&view.message);
-        frame.render_widget(Paragraph::new(format!("{keys}\n {message}")), rows[3]);
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::styled(keys, Style::default().fg(theme.muted)),
+                Line::styled(
+                    format!(" {message}"),
+                    Style::default().fg(if view.snapshot.error.is_some() {
+                        theme.error
+                    } else {
+                        theme.secondary
+                    }),
+                ),
+            ])
+            .style(theme.base()),
+            rows[3],
+        );
+    }
+}
+
+fn draw_cover(frame: &mut Frame, view: &mut View, cover: Rect) {
+    let theme = Theme::named(&view.config.theme);
+    frame.render_widget(
+        theme.block(
+            if view.browser.english {
+                "Cover"
+            } else {
+                "封面"
+            },
+            false,
+        ),
+        cover,
+    );
+    if view.cover_png.is_none() {
+        frame.render_widget(
+            Paragraph::new(if view.browser.english {
+                "No cover"
+            } else {
+                "暂无封面"
+            })
+            .style(theme.subdued()),
+            Rect::new(cover.x + 1, cover.y + 1, cover.width.saturating_sub(2), 1),
+        );
+    } else {
+        view.cover_area = Some(Rect::new(
+            cover.x + 1,
+            cover.y + 1,
+            cover.width.saturating_sub(2),
+            cover.height.saturating_sub(2),
+        ));
     }
 }

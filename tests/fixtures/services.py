@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Local-only S2/S3 acceptance: real QuickJS, HTTP fixtures, SQLite and CLI."""
 import contextlib
+import concurrent.futures
 import http.server
 import io
 import json
@@ -24,13 +25,15 @@ audio = wave_bytes.getvalue()
 
 
 def song(number):
-    return {'id': number, 'name': f'Track {number}', 'ar': [{'name': 'Artist'}], 'al': {'id': 8, 'name': 'Album'}, 'dt': 4000, 'h': {'br': 320000}}
+    return {'id': number, 'name': f'Track {number}', 'ar': [{'name': 'Artist'}], 'al': {'id': 8, 'name': Server.album_name}, 'dt': 4000, 'h': {'br': 320000}}
 
 
 class Server(http.server.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
     source = ''
     truncated = False
+    track_count = 101
+    album_name = 'Album'
     audio_mode = 'valid'
     active = 0
     maximum = 0
@@ -78,16 +81,26 @@ class Server(http.server.BaseHTTPRequestHandler):
         if path == '/api/song/lyric':
             return self.respond(json.dumps({'code': 200, 'lrc': {'lyric': '[00:00.00]first\n[00:01.00]second'}, 'tlyric': {'lyric': '[00:01.00]translation'}}).encode())
         if path == '/api/search/get':
+            if query.get('type') == ['1000']:
+                return self.respond(json.dumps({'code': 200, 'result': {'playlists': [{'id': 10, 'name': 'Fixture playlist', 'creator': {'nickname': 'Fixture'}}], 'playlistCount': 31}}).encode())
             return self.respond(json.dumps({'code': 200, 'result': {'songs': [song(1), song(2)], 'songCount': 2}}).encode())
+        if path == '/r.s':
+            return self.respond(b"{'TOTAL':'1','abslist':[{'playlistid':'10','name':'Fixture playlist','nickname':'Fixture'}]}")
+        if path == '/api/v3/search/special':
+            return self.respond(json.dumps({'errcode': 0, 'data': {'info': [{'specialid': 10, 'specialname': 'Fixture playlist', 'nickname': 'Fixture'}], 'total': 1}}).encode())
+        if path == '/soso/fcgi-bin/client_music_search_songlist':
+            return self.respond(json.dumps({'code': 0, 'data': {'list': [{'dissid': '10', 'dissname': 'Fixture playlist', 'creator': {'name': 'Fixture'}}], 'sum': 1}}).encode())
+        if path == '/music_search/v3/search/searchAll':
+            return self.respond(json.dumps({'songListResultData': {'result': [{'id': '10', 'name': 'Fixture playlist', 'userName': 'Fixture'}], 'totalCount': 1}}).encode())
         if path == '/api/playlist/list':
             return self.respond(json.dumps({'code': 200, 'total': 1, 'playlists': [{'id': 10, 'name': 'All 101 tracks', 'creator': {'nickname': 'Fixture'}}]}).encode())
         if path == '/api/toplist':
             return self.respond(json.dumps({'code': 200, 'list': [{'id': 10, 'name': 'Chart'}]}).encode())
         if path == '/api/v3/playlist/detail':
-            ids = [{'id': i} for i in range(1, 102)]
+            ids = [{'id': i} for i in range(1, self.track_count + 1)]
             if self.truncated:
                 ids.pop()
-            return self.respond(json.dumps({'code': 200, 'playlist': {'trackCount': 101, 'trackIds': ids, 'tracks': [song(1)]}}).encode())
+            return self.respond(json.dumps({'code': 200, 'playlist': {'trackCount': self.track_count, 'trackIds': ids, 'tracks': [song(1)] if ids else []}}).encode())
         if path == '/api/v3/song/detail':
             ids = json.loads(query['ids'][0])
             # Deliberately unordered detail response; adapter must restore ordered IDs.
@@ -159,6 +172,11 @@ with tempfile.TemporaryDirectory(prefix='yuin-services-') as root:
     try:
         search = cli('search', 'fixture', '--platform', 'wy')
         assert len(search['items']) == 2 and search['total'] == 2
+        for platform in ('wy', 'kw', 'kg', 'tx', 'mg'):
+            playlists = cli('playlists', 'search', 'fixture', '--platform', platform)
+            assert playlists['items'][0]['id'] == f'{platform}:10', playlists
+            assert playlists['items'][0]['title'] == 'Fixture playlist'
+        assert cli('playlists', 'search', 'fixture', '--platform', 'wy')['has_more']
         fail(4, 'play', 'wy:1')
         assert cli('status')['state'] == 'error'
         imported = cli('source', 'import', base + '/source.js')['source']
@@ -177,8 +195,65 @@ with tempfile.TemporaryDirectory(prefix='yuin-services-') as root:
         assert [t['song_id'] for t in first['items']] == list(map(str, range(1, 101)))
         saved = cli('library', 'save', 'wy:10', '完整歌单')['playlist']
         assert len(saved['tracks']) == 101
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            favorites = list(pool.map(lambda _: cli('playlists', 'favorite', 'wy:10', '--name', '收藏整单'), range(2)))
+        favorite = favorites[0]['playlist']
+        assert favorites[1]['playlist']['id'] == favorite['id']
+        assert favorite['count'] == 101
+        repeated = cli('playlists', 'favorite', 'wy:10', '--name', 'do not rename')
+        assert repeated['already_saved'] and repeated['playlist']['id'] == favorite['id']
+        assert cli('library', 'show', favorite['id'])['playlist']['name'] == '收藏整单'
+        assert len(cli('library', 'list')['items']) == 2
+        whole = cli('playlists', 'play', 'wy:10')
+        assert whole['state'] == 'playing' and len(whole['queue']) == 101
+        assert [e['track']['song_id'] for e in whole['queue']] == list(map(str, range(1, 102)))
+        assert whole['current'] == whole['queue'][0]['id']
+        assert cli('next')['current'] == whole['queue'][1]['id']
+        local = cli('library', 'play', favorite['id'])
+        assert local['state'] == 'playing' and len(local['queue']) == 101
+        assert local['current'] == local['queue'][0]['id']
+        cli('mode', 'shuffle')
+        shuffled = cli('library', 'play', favorite['id'])
+        assert shuffled['mode'] == 'shuffle' and len(shuffled['queue']) == 101
+        assert cli('next')['current'] != shuffled['current']
+        cli('mode', 'sequential')
+        # A realistic larger snapshot must cross the old 1 MiB transport cap.
+        Server.track_count = 649
+        Server.album_name = 'Album ' + '海' * 700
+        large = cli('playlists', 'play', 'wy:10')
+        assert large['state'] == 'playing' and len(large['queue']) == 649
+        assert [e['track']['song_id'] for e in large['queue']] == list(map(str, range(1, 650)))
+        assert len(json.dumps(large, ensure_ascii=False).encode()) > 1024 * 1024
+        assert len(cli('status')['queue']) == 649
+        assert cli('next')['current'] == large['queue'][1]['id']
+        cli('daemon', 'stop')
+        deadline = time.monotonic() + 5
+        while Path(runtime, 'daemon.sock').exists() and time.monotonic() < deadline:
+            time.sleep(.02)
+        assert not Path(runtime, 'daemon.sock').exists()
+        restored_large = cli('status')
+        assert restored_large['state'] == 'paused' and restored_large['queue'] == large['queue']
+        assert restored_large['current'] == large['queue'][1]['id']
+        Server.track_count = 101
+        Server.album_name = 'Album'
+        cli('playlists', 'play', 'wy:10')
+        before = cli('status')
+        for count in (0,):
+            Server.track_count = count
+            fail(2, 'playlists', 'play', 'wy:10')
+            retained = cli('status')
+            assert retained['queue'] == before['queue'] and retained['current'] == before['current']
+        Server.track_count = 101
+        empty = cli('library', 'create', 'empty')['playlist']
+        fail(2, 'library', 'play', empty['id'])
+        assert cli('status')['queue'] == before['queue']
+        cli('library', 'delete', empty['id'])
+        cli('library', 'delete', favorite['id'])
         Server.truncated = True
         fail(3, 'library', 'save', 'wy:10', 'must not save a preview')
+        fail(3, 'playlists', 'favorite', 'wy:11')
+        fail(3, 'playlists', 'play', 'wy:10')
+        assert cli('status')['queue'] == before['queue']
         Server.truncated = False
         assert len(cli('library', 'list')['items']) == 1
         cli('library', 'move', saved['id'], '0', '100')

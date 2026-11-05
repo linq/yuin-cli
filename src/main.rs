@@ -146,6 +146,29 @@ async fn run_business(command: cli::Command, json: bool) -> anyhow::Result<()> {
     use cli::Command;
     use protocol::AppCommand;
     use services::ServiceCommand;
+    let playlist_playback = match &command {
+        Command::Playlists {
+            command: crate::commands::CollectionCommand::Play { id },
+        } => Some(AppCommand::PlayCollection {
+            id: id.clone(),
+            chart: false,
+        }),
+        Command::Charts {
+            command: crate::commands::CollectionCommand::Play { id },
+        } => Some(AppCommand::PlayCollection {
+            id: id.clone(),
+            chart: true,
+        }),
+        Command::Library {
+            command: crate::commands::LibraryCommand::Play { id },
+        } => Some(AppCommand::PlayLibrary { id: *id }),
+        _ => None,
+    };
+    if let Some(command) = playlist_playback {
+        let snapshot = daemon::call(command, true).await?;
+        print_value(&serde_json::to_value(snapshot)?, json);
+        return Ok(());
+    }
     let download_wait = matches!(&command, Command::Download { wait: true, .. });
     let service = match command {
         Command::Search {
@@ -157,11 +180,11 @@ async fn run_business(command: cli::Command, json: bool) -> anyhow::Result<()> {
             platform,
             page,
         }),
-        Command::Playlists { command } => Some(command.service(false)),
-        Command::Charts { command } => Some(command.service(true)),
+        Command::Playlists { command } => Some(command.service(false)?),
+        Command::Charts { command } => Some(command.service(true)?),
         Command::Source { command } => Some(command.service()),
         Command::Config { command } => Some(command.service()),
-        Command::Library { command } => Some(command.service()),
+        Command::Library { command } => Some(command.service()?),
         Command::Lyrics { track, refresh } => Some(ServiceCommand::Lyrics { track, refresh }),
         Command::Import { path, commit } => Some(ServiceCommand::Import {
             path: absolute(path)?,

@@ -22,6 +22,11 @@ pub enum ServiceCommand {
         platform: Option<Platform>,
         page: u32,
     },
+    SearchCollections {
+        query: String,
+        platform: Option<Platform>,
+        page: u32,
+    },
     Collections {
         platform: Option<Platform>,
         charts: bool,
@@ -74,6 +79,11 @@ pub enum ServiceCommand {
     LibrarySave {
         name: String,
         collection: String,
+        chart: bool,
+    },
+    LibraryFavorite {
+        collection: String,
+        name: String,
         chart: bool,
     },
     LibraryRename {
@@ -152,6 +162,19 @@ impl Services {
         services.downloads.restore(&services).await?;
         Ok(services)
     }
+    pub async fn collection_tracks(&self, id: &str, chart: bool) -> Result<Vec<Track>> {
+        self.catalog.all_tracks(id, chart).await.map_err(network)
+    }
+
+    pub async fn library_tracks(&self, id: Uuid) -> Result<Vec<Track>> {
+        let value = self
+            .storage
+            .record_get(RecordKind::Playlist, id.to_string())
+            .await?
+            .ok_or_else(|| RpcError::new(6, "Library list not found"))?;
+        Ok(serde_json::from_value::<crate::domain::LocalPlaylist>(value)?.tracks)
+    }
+
     pub async fn track(&self, input: &str) -> Result<Track> {
         if input.starts_with("local:")
             && let Some(track) = self.storage.track(input.to_string()).await?
@@ -264,6 +287,19 @@ impl Services {
                     .map_err(network)?;
                 self.storage.put_tracks(result.items.clone()).await?;
                 serde_json::to_value(result)?
+            }
+            SearchCollections {
+                query,
+                platform,
+                page,
+            } => {
+                let platform = platform.unwrap_or(self.config.read().await.platform);
+                serde_json::to_value(
+                    self.catalog
+                        .search_collections(&query, platform, page)
+                        .await
+                        .map_err(network)?,
+                )?
             }
             Collections {
                 platform,
@@ -397,6 +433,33 @@ impl Services {
             LibraryAdd { id, track } => {
                 let track = self.track(&track).await?;
                 json!({"playlist":self.storage.library_edit(id,LibraryEdit::Add{tracks:vec![track]}).await?})
+            }
+            LibraryFavorite {
+                collection,
+                name,
+                chart,
+            } => {
+                validate_name(&name)?;
+                crate::catalog::parse_id(&collection)?;
+                let id = Uuid::new_v5(
+                    &Uuid::NAMESPACE_URL,
+                    format!("yuin:collection:{chart}:{collection}").as_bytes(),
+                );
+                if let Some(value) = self
+                    .storage
+                    .record_get(RecordKind::Playlist, id.to_string())
+                    .await?
+                {
+                    let list: crate::domain::LocalPlaylist = serde_json::from_value(value)?;
+                    json!({"playlist":{"id":list.id,"name":list.name,"count":list.tracks.len()},"already_saved":true})
+                } else {
+                    let tracks = self.collection_tracks(&collection, chart).await?;
+                    let list = self
+                        .storage
+                        .library_edit(id, LibraryEdit::CreateOnce { name, tracks })
+                        .await?;
+                    json!({"playlist":{"id":list.id,"name":list.name,"count":list.tracks.len()},"already_saved":false})
+                }
             }
             LibrarySave {
                 name,

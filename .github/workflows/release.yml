@@ -44,7 +44,7 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
       - run: cargo build --release --locked
-      - run: python3 scripts/verify-tui.py target/release/yuin
+      - run: python3 scripts/verify-tui.py target/release/yuin --large-playlist
       - name: Create portable archive and optional macOS installer
         env:
           TARGET: ${{ matrix.target }}

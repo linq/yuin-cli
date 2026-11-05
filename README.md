@@ -44,10 +44,15 @@ yuin daemon stop                              # also stop child processes
 
 Business commands start the daemon as needed; status never plays restored audio. `doctor`, `paths`, help, version, completions and man are read-only. `daemon stop` never starts a daemon. Track IDs from search are stable; other than NetEase, uncached IDs require a search or collection lookup first so hash/album metadata is available. No platform substitution or automatic source switching occurs.
 
+Replacing the executable does not update an already-running daemon. If a new command is rejected after an update, run `yuin daemon stop` with the updated executable, then reopen the TUI or retry the command. Queue and playback position are retained; a restarted daemon restores playback paused.
+
 ## Lists, queues and offline files
 
 ```sh
 yuin playlists list --platform wy
+yuin playlists search 'jazz' --platform wy --page 1
+yuin playlists favorite wy:654321 --name 'Commute'
+yuin playlists play wy:654321
 yuin playlists show wy:654321 --page 2
 yuin charts list --platform kw
 yuin charts show kw:93 --all
@@ -56,6 +61,7 @@ yuin library add <list-uuid> wy:123456
 yuin library favorite wy:123456
 yuin library save wy:654321 'Saved complete collection'
 yuin library show <list-uuid> --page 2
+yuin library play <list-uuid>
 yuin library move <list-uuid> 0 3              # indices are zero-based
 yuin library remove <list-uuid> 0
 yuin queue add wy:123456
@@ -77,11 +83,19 @@ yuin lyrics wy:123456
 
 A download without `--wait` enqueues a persistent task; `--wait` waits for success or returns an error. At most two files transfer concurrently (configurable to one); pending tasks are limited to 100. Temporary files are removed on failure/cancel. Completed files are published atomically without overwriting a target. HTTP status, size, magic, full decoding and requested quality are checked. FLAC 24-bit is verified from STREAMINFO, not decoded floating-point samples; encoding checks cannot certify the original recording. Same-ID/quality offline files are revalidated against their SHA-256 before playback. `source stop` disables the source; validated matching downloads still play.
 
-The queue is limited to 500 entries and a 1 MiB snapshot. Personal lists allow 10,000 tracks, complete catalog fetches up to 100 pages. Personal-list pages and download/history pages contain 100 items. If a recommendation API does not provide a trustworthy total, JSON reports `total: null`. EOF stops at the end in sequential mode; failures require an explicit retry.
+The queue is limited to 10,000 entries and a 16 MiB snapshot. Personal lists allow 10,000 tracks, complete catalog fetches up to 100 pages. Personal-list pages and download/history pages contain 100 items. If a recommendation API does not provide a trustworthy total, JSON reports `total: null`. EOF stops at the end in sequential mode; failures require an explicit retry.
+
+Favoriting a collection saves its complete paginated contents once as a local snapshot. Repeated favorites preserve edits and do not create duplicates. Whole-playlist playback replaces the queue only after the complete list is fetched, preserves its order, and honors the current playback mode; shuffle chooses a random first track. Empty, truncated, oversized or over-10,000-track playlists are rejected without changing the current queue.
 
 ## TUI and preferences
 
-The default page is Playlists. `/` edits a search query; text input owns Space/j/k/q. Tab cycles navigation/content/queue focus; arrows or j/k select; 1–5 change pages; Enter opens a collection or plays; Backspace returns without losing selection/scroll; `]` appends a page; a queues, d downloads, f favorites, x cancels a selected download, r refreshes, P changes the default platform, l toggles synchronized lyrics, Space pauses/resumes, n/p changes tracks, ←/→ seeks, +/- adjusts volume, s stops and q/Esc/Ctrl+C leaves. On small terminals Tab can reveal the collapsed queue.
+The default page is Playlists. `/` searches playlists on that page and tracks elsewhere; Ctrl+U clears the query, and submitting an empty playlist query restores recommendations. Text input owns Space/j/k/q. Tab cycles navigation/content/queue focus; arrows or j/k select; 1–5 change pages; Enter opens a collection or plays; Backspace returns without losing selection/scroll; `]` appends a page; a queues, d downloads, f favorites, x cancels a selected download, r refreshes, P changes the default platform, l toggles synchronized lyrics, Space pauses/resumes, n/p changes tracks, ←/→ seeks, +/- adjusts volume, s stops and q/Esc/Ctrl+C leaves. On small terminals Tab can reveal the collapsed queue.
+
+The default Catppuccin Macchiato theme uses blue-gray backgrounds, mauve selections, blue prompts and green playback status. Terminal/default, dark and light themes remain available.
+
+Ghostty, WezTerm and Kitty display the current track's cover when the terminal is large enough. Missing artwork, unsupported terminals and tmux/screen use the text interface; artwork fetch failures do not interrupt playback.
+
+On a playlist/chart list or detail page, **F (Shift+f)** favorites the complete collection and **b** plays it. Saved playlists in My Library also support b. Lowercase f favorites individual tracks in detail pages and the selected whole playlist in playlist lists. Search input keeps these keys as text.
 
 ```sh
 yuin config get --json
@@ -90,7 +104,7 @@ yuin config set play_quality 320k
 yuin config set download_quality flac
 yuin config set download_dir '/absolute/path/to/downloads'
 yuin config set download_concurrency 2
-yuin config set theme terminal                 # terminal, dark, light
+yuin config set theme macchiato                # macchiato (default), terminal, dark, light
 yuin config set language en                    # en, zh-CN
 yuin config set fade_seconds 5                 # 0–10; default 0
 yuin config set media_keys true                # restart the daemon afterward
