@@ -10,7 +10,7 @@
 - 用户已确认：Rust 开发；同时支持脚本化命令行和交互式 TUI。
 - 当前创建位置：`/Users/linq/Dev/yuin-cli`。参考桌面项目：`/Users/linq/Dev/mymusic`。
 
-本次交付为项目骨架与技术方案。已经可运行的是帮助、版本、只读环境检查、路径查询及 TUI 导航。下面描述的目录查询、源执行、音频播放、后台服务、数据库与下载均为后续实施方案，不能视为已经完成。
+S0–S4 的功能代码、本地打包与草稿发行工作流已落地，当前版本仍为 0.1.0-dev。五平台真实目录和样本播放、Hei Music worker、完整下载至停源后离线播放均已验证。硬件媒体键、设备切换、多架构运行、签名公证及远程发行仍需对应环境或发行元数据，不能视为全部验收完成。范围与结果以 [STATUS](STATUS.md) 为准。下文保留架构决策与验收门槛。
 
 ## 2. 产品范围与实施原则
 
@@ -46,9 +46,9 @@ TUI（Ratatui） ───┘                         │
 
 理由：初期最大的兼容成本在平台接口与 LX 源协议；已有成熟音频后端可以缩短真实闭环，避免同时重写 HTTP 可定位缓存、各种容器解复用和音频设备恢复。mpv 官方提供 JSON IPC 控制接口。[mpv 手册](https://mpv.io/manual/stable/#json-ipc)
 
-代价：第一版需要另行安装 mpv，发布包不是完全自包含，也不应宣传为全部依赖均由 Rust 实现。当前骨架只检查 PATH 中是否存在 mpv，没有安装或捆绑它。后续若需要自包含分发，再评估内嵌 libmpv 的构建／许可成本，或用 rodio + Symphonia 替换这个后端；不同时维护两套生产音频实现。
+代价：第一版需要另行安装 mpv，发布包不是完全自包含，也不应宣传为全部依赖均由 Rust 实现。已接入本地／在线 mpv 播放；本机开发验收通过 Homebrew 单独安装，项目没有捆绑它。doctor 只读检查 PATH 或 YUIN_MPV 指定的可执行文件。后续若需要自包含分发，再评估内嵌 libmpv 的构建／许可成本，或用 rodio + Symphonia 替换这个后端；不同时维护两套生产音频实现。
 
-mpv 以参数数组启动，不拼接 Shell 命令；禁用用户配置、外部脚本自动加载、终端输入和视频窗口，使用私有 IPC 端点。Rust 侧只发送允许的播放命令，不把它的任意命令接口直接暴露给客户端。
+mpv 以参数数组启动，不拼接 Shell 命令；禁用用户配置、外部脚本自动加载、终端输入和视频窗口，使用私有继承 socketpair（`--input-ipc-client=fd://0`），不创建 mpv 公共控制 socket；mpv 在连接断开时退出，也覆盖 daemon 被强制终止的情况。Rust 侧只发送允许的播放命令，不把它的任意命令接口直接暴露给客户端。
 
 ### LX 源采用独立 QuickJS worker
 
@@ -65,15 +65,15 @@ mpv 以参数数组启动，不拼接 Shell 命令；禁用用户配置、外部
 | 错误与输出 | anyhow；后续业务错误用 thiserror | stderr 日志、stdout 业务输出分开 |
 | 序列化 | serde + serde_json | 已接入只读 JSON 输出；后续 RPC 与数据模型 |
 | 应用路径 | directories | 已接入独立目录查询 |
-| 异步与进程 | Tokio | 后续网络、超时、子进程监督、本地 IPC |
-| HTTP | reqwest | 后续复用 Client、流式下载、请求取消与超时 |
-| 存储 | SQLite + rusqlite（bundled） | 后续事务、迁移、播放队列与下载任务 |
-| 配置 | TOML | 后续可读配置，运行中变更由 daemon 串行保存 |
-| JS 引擎 | rquickjs / QuickJS | 后续 LX worker，先做协议与真实脚本验证 |
-| 音频 | mpv JSON IPC | 后续独立音频引擎；当前不属于 Rust 编译依赖 |
-| 下载校验 | 媒体头解析；必要时 Symphonia | 后续验证容器、编码和质量声明 |
+| 异步与进程 | Tokio | S1 已接入超时、子进程监督、本地 IPC；网络后续 |
+| HTTP | reqwest | 已接入复用 Client、流式下载、请求取消与超时 |
+| 存储 | SQLite + rusqlite（bundled） | S1 已接入初始迁移、事务队列与进度恢复；下载后续 |
+| 配置 | TOML | 已接入，daemon 校验后私有原子保存 |
+| JS 引擎 | rquickjs / QuickJS | 已接入 worker，并通过受控脚本与 Hei Music 样本检查 |
+| 音频 | mpv JSON IPC | S1 已接入本地播放；外部运行依赖 |
+| 下载校验 | 媒体头解析 + Symphonia | 已接入完整解码、码率／FLAC STREAMINFO 校验 |
 
-骨架仅添加当前实际使用的依赖；不先下载所有未来技术栈。应用提交 Cargo.lock；Rust toolchain 跟随 stable，本机首次验证版本记录于 STATUS。具体后续依赖版本在接入时通过官方文档与构建确定，不将本文作为永久版本锁。
+只添加当前实际使用的依赖；S1 增加 Tokio、rusqlite（bundled）、UUID 与 SHA-256，不预先引入后续阶段依赖。应用提交 Cargo.lock；Rust toolchain 跟随 stable，本机首次验证版本记录于 STATUS。具体后续依赖版本在接入时通过官方文档与构建确定，不将本文作为永久版本锁。
 
 参考：[clap](https://docs.rs/clap/latest/clap/)、[Ratatui](https://docs.rs/ratatui/latest/ratatui/)、[Crossterm](https://docs.rs/crossterm/latest/crossterm/)、[reqwest](https://docs.rs/reqwest/latest/reqwest/)、[rusqlite](https://docs.rs/rusqlite/latest/rusqlite/)、[directories](https://docs.rs/directories/latest/directories/struct.ProjectDirs.html)。
 
@@ -87,7 +87,7 @@ src/
   cli.rs              # CLI 命令定义；当前已有
   doctor.rs           # 只读诊断；当前已有
   paths.rs            # 平台目录；当前已有
-  tui.rs              # 当前为导航骨架；后续拆成 tui/ 模块
+  tui.rs + tui/       # 交互、异步请求、浏览路由与渲染
   app/                # 命令、事件、状态转换、业务服务
   domain/             # Track、QueueEntry、Playlist、SourceCapability
   catalog/            # kw / kg / tx / wy / mg 适配器
@@ -108,7 +108,7 @@ src/
 - `CollectionPage<T>` 包含 items、total 和是否还有后续页；保存整单必须拉取完整内容，不能把第一页误报为整单。
 - `ResolvedMedia` 是短期结果，包含 URL、必要请求头及已知有效期；持久队列不以临时播放 URL 为身份。
 
-## 6. CLI 设计（目标接口，尚未实现）
+## 6. CLI 设计（完整目标接口）
 
 ```sh
 yuin                              # 交互终端进入 TUI
@@ -138,7 +138,7 @@ yuin config set platform wy
 yuin daemon stop
 ```
 
-当前实际支持的子命令以 `yuin --help` 为准，上述例子是后续命令契约。搜索先保存完整 Track 元数据，播放时通过 ID 找到缓存元数据或查询平台详情；缺失时明确报错，不将 ID 当成 URL。
+当前实际支持的子命令以 `yuin --help` 为准。`play <path-or-platform:id>` 与 `queue add <path-or-platform:id>` 接受本地文件或平台 ID，`queue play <entry-uuid>` 播放已有条目，并提供 pause/resume/stop/next/previous/seek/volume/status、队列查询／移除／清空和 daemon start/stop。平台目录、音乐源、个人列表、配置和下载命令现已实现，另有歌词、迁移、补全和手册入口。搜索先保存完整 Track 元数据，播放时通过 ID 找到缓存元数据或查询平台详情；缺失时明确报错，不将 ID 当成 URL。
 
 输出约定：人类可读表格为默认；`--json` 返回有 schema_version 的稳定结构，进度和诊断仅进入 stderr；非交互模式不自动选择结果、不进入 TUI、不输出 ANSI 控制序列。建议退出码：0 成功、1 内部错误、2 参数错误、3 平台／网络不可用、4 音乐源错误、5 播放／音频设备错误、6 资源不存在或 daemon 不可用。
 
@@ -163,7 +163,7 @@ yuin daemon stop
 
 q 只断开界面，daemon 播放继续；停止播放和关闭 daemon 是明确的独立操作。TUI 每次进入获取全量快照，再订阅增量事件；网络请求有取消和版本号，旧查询完成后不能覆盖新结果。界面按需重绘，高频事件合并，播放进度重绘上限建议 20–30 fps；目录查询与数据库工作不在渲染线程执行。
 
-当前骨架仅包含五页导航、退出和窗口缩放处理；完整分区、输入框、歌曲列表和这些播放快捷键均待实现。当前默认第一页为 Search，接入目录数据时按上述产品约定调整为歌单。
+已加入播放状态栏、真实目录／搜索／个人列表／下载、本地队列、Tab 焦点切换、Enter 播放、Space 暂停／继续、n/p 切歌、左右定位、+/- 音量、s 停止，默认歌单页。选中项按 QueueEntry UUID 保留，小窗口合并为导航与队列两列；页面内容仍明确提示目录功能待实现。搜索输入拥有文本按键，路由保存列表与滚动，旧查询通过版本号失效，追加页与返回保位。TUI 断线后连接已有 daemon 并获取全量快照，不自动重启被显式停止的服务。
 
 ## 8. 目录查询与音乐源兼容
 
@@ -181,7 +181,7 @@ LX bridge 目标：
 
 worker 与监督进程使用有 request_id 的 JSON Lines 协议，stdout 仅输出协议，日志写 stderr；限制单帧大小。初始建议：脚本上限 9 MiB，初始化 15 秒，解析 65 秒，VM 内存 128 MiB；这些是配置起点，需以真实脚本测量调整。超时先协作取消，500 ms 后仍未退出则终止进程并回收全部请求。
 
-源导入保存脚本快照、SHA-256、元数据和原始链接。更新先在候选 worker 中初始化，成功后原子替换；失败保留原版本。多源可保存，同时只激活一个，不自动切源。真实验收优先使用用户先前提供的 Hei Music 样本，记录版本和哈希；本次创建项目未下载或执行该第三方脚本。
+源导入保存脚本快照、SHA-256、元数据和原始链接。更新先在候选 worker 中初始化，成功后原子替换；失败保留原版本。多源可保存，同时只激活一个，不自动切源。已用方案指定的 Hei Music 样本执行真实检查，版本／哈希与边界见 STATUS；脚本不随仓库或安装包分发。
 
 ## 9. daemon、IPC 与生命周期
 
@@ -195,9 +195,9 @@ macOS/Linux 使用 Unix domain socket；runtime 目录只允许当前用户访�
 
 ## 10. 存储、配置与迁移
 
-使用 directories::ProjectDirs::from("dev", "linq", "yuin-cli") 生成独立路径。以 `yuin paths --json` 的实际输出为准；macOS 的配置／数据位于 `~/Library/Application Support/dev.linq.yuin-cli`，缓存在对应系统缓存目录。初始骨架只显示路径，不创建数据文件。
+使用 directories::ProjectDirs::from("dev", "linq", "yuin-cli") 生成独立路径。以 `yuin paths --json` 的实际输出为准；macOS 的配置／数据位于 `~/Library/Application Support/dev.linq.yuin-cli`，缓存在对应系统缓存目录。doctor/paths 仍只读；首次业务命令才创建 SQLite。S1 提供 YUIN_DATA_DIR 绝对根目录覆盖以隔离测试，runtime 在 `/tmp/yuin-<uid>-<data-hash>`，避免 Unix socket 路径长度限制；数据路径别名归一后共享锁。
 
-后续文件：config.toml、library.sqlite3、sources/<id>/<hash>.js、cache/audio、cache/artwork、运行时 socket／锁。数据库仅由 daemon 持有写入端；SQLite 访问用专用阻塞线程或受限 spawn_blocking，不能阻塞异步调度器。
+后续文件：config.toml、library.sqlite3、sources/<id>/<hash>.js、cache/audio、cache/artwork、运行时 daemon socket／锁／诊断日志；mpv 直接使用继承连接。数据库仅由 daemon 持有写入端；SQLite 访问用专用阻塞线程或受限 spawn_blocking，不能阻塞异步调度器。
 
 建议表：tracks、playlists、playlist_tracks、queue_entries、queue_state、sources、history、downloads、schema_migrations。列表顺序、重复入队和源更新使用事务；开启外键、设置 busy timeout，迁移前生成可恢复快照。
 
@@ -218,17 +218,35 @@ macOS/Linux 使用 Unix domain socket；runtime 目录只允许当前用户访�
 | 阶段 | 交付内容 | 验收 |
 | --- | --- | --- |
 | S0：本次 | 项目、CLI/TUI 骨架、doctor、paths、文档、CI 配置 | 编译、格式、clippy、帮助／JSON／非 TTY 行为；交互终端退出恢复 |
-| S1：播放核心 | daemon、IPC、SQLite 初始迁移、mpv 本地播放 | 一终端播放本地测试音频，另一终端暂停／定位；退出 TUI 仍播放；重启恢复但不自动出声 |
-| S2：真实闭环 | 网易云目录、LX worker、源导入、在线播放、单曲下载 | 搜索 → 解析 → 播放 → 下载 → 停源断网后播放同一文件；失败与取消可解释 |
-| S3：日常使用 | 歌单／排行榜全量分页、个人列表、其余四平台、下载调度 | 完整列表数量正确；按 ID 保留选择和滚动；CLI/TUI 状态一致 |
-| S4：体验与发行 | 歌词、主题／语言、媒体键、播放过渡、安装包／Homebrew | 真机连续使用、断网／源崩溃／设备切换；按架构发布并附校验和 |
+| S1：播放核心（已实现） | daemon、IPC、SQLite 初始迁移、mpv 本地播放 | 一终端播放本地测试音频，另一终端暂停／定位；退出 TUI 仍播放；重启恢复但不自动出声 |
+| S2：真实闭环（已实现） | 网易云目录、LX worker、源导入、在线播放、单曲下载 | 搜索 → 解析 → 播放 → 下载 → 停源断网后播放同一文件；失败与取消可解释 |
+| S3：日常使用（已实现） | 歌单／排行榜全量分页、个人列表、其余四平台、下载调度 | 完整列表数量正确；按 ID 保留选择和滚动；CLI/TUI 状态一致 |
+| S4：体验与发行（代码／本机打包已实现） | 歌词、主题／语言、媒体键、播放过渡、安装包／Homebrew | 真机连续使用、断网／源崩溃／设备切换；按架构发布并附校验和 |
 
 每阶段先完成真实链路再扩展。自动测试用本地 HTTP fixture、生成的短音频和受控 JS，不默认访问真实平台；真实网络、真实脚本与音频设备测试显式启用并分别报告。CI 编译成功、虚拟音频通过、真实音乐源兼容是三个不同结论。
 
-发布计划是 GitHub Actions 编译 macOS arm64/x86_64 与 Linux 目标，tag 上传二进制和 SHA-256；当前只创建 CI 工作流，不创建远程仓库或发布。mpv 的安装依赖和平台运行要求需随包说明，捆绑前核对许可证。
+发布计划是 GitHub Actions 编译 macOS arm64/x86_64 与 Linux 目标，tag 上传二进制和 SHA-256；当前 CI 执行格式、clippy、隔离自动测试、Release 构建和受控 PTY 检查，不创建远程仓库或发布。mpv 的安装依赖和平台运行要求需随包说明，捆绑前核对许可证。
 
 ## 13. 外部资料与许可
 
 资料核对日期：2026-11-04。以上库文档来自官方维护的 docs.rs 页面，音频 IPC 来自 mpv 官方手册，Rust 安装来自 [Rust 官方安装页](https://rust-lang.org/tools/install/)。
 
-桌面项目的 Swift/JS 文件用于理解行为和边界，本次没有复制进 Rust 项目。现有桌面版第三方说明明确记录 LX 的 Apache-2.0 来源与部分算法适配；后续若移植桥接脚本、签名算法或测试样本，应同步核对来源、保留所需许可和说明，不因改写成 Rust 就移除归属信息。仓库自身的开源许可证尚未选择，暂设 publish = false。
+桌面项目的 Swift/JS 文件用于理解行为和边界，目录／歌词协议与 LX bridge 已按参考项目适配，来源与 LX 许可见 [第三方说明](THIRD_PARTY_NOTICES.md)。现有桌面版第三方说明明确记录 LX 的 Apache-2.0 来源与部分算法适配；后续若移植桥接脚本、签名算法或测试样本，应同步核对来源、保留所需许可和说明，不因改写成 Rust 就移除归属信息。仓库自身的开源许可证尚未选择，暂设 publish = false。
+
+## 14. S1 实现补充
+
+- 业务 JSON 快照包含 `schema_version=1`、daemon `instance_id` 与实例内递增 `sequence`。TUI 丢弃旧快照；事件携带全量快照，订阅慢客户端断开后重新获取快照。
+- RPC 单帧上限 1 MiB、同时最多 32 个客户端、请求超时 120 秒（源解析限时 65 秒，保留目录与控制预算）。S1 队列最多 500 项且受快照容量限制。
+- SQLite 使用专用线程；队列变化事务保存，位置每五秒单独 checkpoint；正常暂停、定位和关闭也保存。被强制终止最多损失最近一次 checkpoint 后的进度，重启始终暂停。
+- mpv 启动首个应答限时 8 秒，普通命令 2 秒，本地加载 4 秒、远程加载 30 秒。加载期间只读状态请求直接读取共享快照；断开尚未完成的请求会取消加载。
+- 默认自动测试依赖 Python 3 协议 fixture，不访问平台或音频设备。真实 mpv 与 PTY 验证显式执行；当前 Apple Silicon 检查使用生成的静音 WAV，未宣称已人工听辨或完成 Linux 真机音频验收。
+
+## 15. 后续阶段实现说明
+
+- 平台 Track 已保存完整源参数，ResolvedMedia 仅用于短期加载；请求头经私有 mpv IPC 设置。离线索引按稳定 ID／音质查询，文件重新验证后优先使用。
+- 源导入会执行候选初始化；独立 QuickJS worker 不是 OS 网络沙箱。初始化／解析失败向调用者传播，更新失败不覆盖原记录。
+- 加载不占用串行控制循环。CLI 等待最终结果，TUI 对已接受加载使用 detached 请求；退出界面不取消已接受播放。未完成普通请求断开则协作取消，generation 拦截旧结果。
+- SQLite schema 已到 v3；个人列表顺序及重复约束以事务内元数据文档保存，源、下载、历史单独存表。队列与播放模式持久化。
+- 个人列表／下载／历史按每页 100 条输出；1 MiB RPC 上限继续生效。大列表完整保存到数据库，不以单次客户端输出容量截断保存。
+- JSON 迁移先预览，commit 前备份，源默认不启用，旧下载必须存在并通过音质验证；旧队列明确报告为不导入，以保持当前播放与偏好。
+- 歌词、语言／主题、媒体控制、0–10 秒旧曲淡出、补全／手册、压缩包与 pkg 及草稿 release 流水线已加入。公开发布前仍需真实仓库 URL、项目许可证；签名公证需发行凭据。

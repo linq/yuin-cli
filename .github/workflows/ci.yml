@@ -18,3 +18,5 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
       - run: cargo build --release --locked
+      - name: Verify terminal controls with an isolated player fixture
+        run: python3 scripts/verify-tui.py target/release/yuin
