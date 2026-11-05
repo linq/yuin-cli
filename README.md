@@ -8,7 +8,7 @@ Yuin in your terminal: a Rust CLI and TUI sharing one background player, queue a
 
 - Public track search, playlists and charts for NetEase (`wy`), Kuwo (`kw`), QQ (`tx`), Kugou (`kg`) and Migu (`mg`). Stable platform IDs retain the metadata required by LX sources. Complete collection saves verify paging and counts.
 - LX API 2.0 sources in independent QuickJS processes: local/online import, explicit activation, capability checks, hash-verified snapshots and candidate updates with rollback. Sources receive HTTP, timers, byte/crypto/zlib helpers; no filesystem, shell or Node modules are exposed. Source scripts can access the network: choose scripts you trust. Import initializes the candidate script.
-- Local/online mpv playback, shared controls, independent queue entry UUIDs, queue reordering, sequential/shuffle/repeat-one modes, position/volume recovery paused after restart, and optional old-track fade.
+- Built-in local/online audio playback, shared controls, independent queue entry UUIDs, queue reordering, sequential/shuffle/repeat-one modes, position/volume recovery paused after restart, and optional old-track fade.
 - Personal lists, favorites, history, validated offline downloads, cancellation/retry, lyrics with local caching, themes and English/Chinese UI. System media keys are optional.
 - Private versioned Unix RPC, a single daemon/SQLite writer, bounded requests, cancellation and generation checks. TUI exit leaves accepted playback running, including a track still loading.
 - Native/desktop JSON import preview, backed-up transactional import, private exports, shell completions, a manual, portable packaging, optional macOS installer and draft-release CI.
@@ -17,7 +17,7 @@ Implementation and validation are separate. Apple Silicon real checks passed for
 
 ## Build and run
 
-Install Rust stable and **mpv** separately (`brew install mpv` on macOS, or your Linux distribution's mpv package). The tested backend is mpv 0.41.0; mpv is not bundled.
+Source builds need Rust stable. Audio uses the built-in Symphonia decoder and system output; macOS needs no mpv or Homebrew audio packages. Linux builds need `libasound2-dev` and `pkg-config`; Linux runtime requires ALSA.
 
 ```sh
 ./scripts/cargo.sh build --release --locked
@@ -93,7 +93,7 @@ The default page is Playlists. `/` searches playlists on that page and tracks el
 
 The default Catppuccin Macchiato theme uses blue-gray backgrounds, mauve selections, blue prompts and green playback status. Terminal/default, dark and light themes remain available.
 
-Ghostty, WezTerm and Kitty show two independent covers when space permits: the image-only right preview follows the selected playlist/track, while the player-bar thumbnail always follows actual playback. Preview loads wait about 200 ms and reuse a bounded memory cache. Saved playlists use artwork from their tracks when no separate cover is available. With no browsing selection or in lyrics view, the large preview follows playback. Missing preview images leave the panel empty; narrow windows collapse images, and unsupported terminals or tmux/screen use text. Artwork failures do not interrupt playback.
+Ghostty, WezTerm and Kitty show two independent covers when space permits: the image-only right preview follows the selected playlist/track, while the player-bar thumbnail always follows actual playback. Preview loads wait about 200 ms and reuse a bounded memory cache. Saved playlists use artwork from their tracks when no separate cover is available. With no browsing selection or while the lyrics panel has focus, the large preview follows playback; focusing the queue still previews its selected track in lyrics view. Missing preview images leave the panel empty; narrow windows collapse images, and unsupported terminals or tmux/screen use text. Artwork failures do not interrupt playback.
 
 On a playlist/chart list or detail page, **F (Shift+f)** favorites the complete collection and **b** plays it. Saved playlists in My Library also support b. Lowercase f favorites individual tracks in detail pages and the selected whole playlist in playlist lists. Search input keeps these keys as text.
 
@@ -114,7 +114,7 @@ The old track fades after the new track starts at normal volume; stop/pause canc
 
 ## Data, import and distribution
 
-`yuin paths --json` reports independent config/data/cache/runtime locations. SQLite migrations back up existing databases. Playback position is checkpointed every five seconds and on controls/shutdown. `YUIN_DATA_DIR` selects an absolute isolated root; `YUIN_MPV` overrides the executable without shell arguments.
+`yuin paths --json` reports independent config/data/cache/runtime locations. SQLite migrations back up existing databases. Playback position is checkpointed every five seconds and on controls/shutdown. `YUIN_DATA_DIR` selects an absolute isolated root; `YUIN_MPV` is no longer used. System output is the default; `YUIN_AUDIO_OUTPUT=null` explicitly selects silent diagnostic output while retaining real decoding.
 
 ```sh
 yuin export '/absolute/path/backup.json' --include-sources
@@ -130,6 +130,12 @@ Every business JSON response has `schema_version`; playback snapshots also have 
 
 Local packaging and the Homebrew formula generator are documented in [packaging/INSTALL.md](packaging/INSTALL.md). The project repository is [linq/yuin-cli](https://github.com/linq/yuin-cli), licensed under [Apache-2.0](LICENSE). Release artifacts must be uploaded before the generated Homebrew formula can be installed. Local `.pkg` files are unsigned and not notarized. Windows playback is outside this implementation's accepted platform scope.
 
+## Stop background playback
+
+`q` closes the TUI and keeps background playback. Use `yuin pause` to retain the current position, `yuin stop` to stop and reset the current track while keeping the queue, or `yuin daemon stop` to close the service. Restart restores playback paused. In the TUI, Space pauses/resumes and `s` stops.
+
+After updating the binary, run `yuin daemon stop` before reopening the TUI so the daemon uses the new audio backend.
+
 ## Checks
 
 ```sh
@@ -139,9 +145,9 @@ Local packaging and the Homebrew formula generator are documented in [packaging/
 python3 scripts/verify-tui.py target/release/yuin
 
 # Explicit real-device/service checks (generated silence or a trusted source)
-./scripts/cargo.sh test --locked --test daemon real_mpv_controls_and_restart -- --ignored
-python3 scripts/verify-tui.py target/release/yuin --real-mpv
+./scripts/cargo.sh test --locked --test daemon real_audio_controls_and_restart -- --ignored
+python3 scripts/verify-tui.py target/release/yuin --real-audio
 python3 scripts/verify-real.py target/release/yuin --source /path/to/trusted-source.js
 ```
 
-Default tests require Python 3 and use local HTTP, controlled JS, generated silence and an mpv protocol fixture. They do not access music platforms or audio devices. Dependency notices and synthetic test-audio provenance are retained; no third-party music-source script or recorded music is distributed.
+Default tests require Python 3 and use local HTTP, controlled JS, generated audio, real Symphonia decoding and a clocked silent PCM output. They do not access music platforms or audio devices. Dependency notices and synthetic test-audio provenance are retained; no third-party music-source script or recorded music is distributed.

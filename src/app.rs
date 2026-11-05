@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::{
     domain::{PlaybackMode, PlaybackState, QueueEntry, Snapshot},
-    playback::{BackendEvent, Event, Mpv},
+    playback::{BackendEvent, Event, Player},
     protocol::{AppCommand, MAX_QUEUE, MAX_RESPONSE_FRAME, RpcError},
     storage::Storage,
 };
@@ -22,7 +22,7 @@ pub struct Envelope {
 
 struct Loaded {
     generation: u64,
-    result: Result<(Mpv, Option<Mpv>, f64, u8), RpcError>,
+    result: Result<(Player, Option<Player>, f64, u8), RpcError>,
     track: crate::domain::Track,
 }
 struct Pending {
@@ -36,7 +36,7 @@ pub struct Core {
     services: std::sync::Arc<crate::services::Services>,
     state: Snapshot,
     storage: Storage,
-    backend: Option<Mpv>,
+    backend: Option<Player>,
     loading: Option<tokio::task::JoinHandle<()>>,
     loaded: mpsc::Receiver<Loaded>,
     load_sender: mpsc::Sender<Loaded>,
@@ -299,7 +299,8 @@ impl Core {
             .clone();
         self.state.state = PlaybackState::Resolving;
         self.state.position = position;
-        self.state.duration = None;
+        self.state.duration =
+            (track.duration.is_finite() && track.duration > 0.0).then_some(track.duration);
         self.state.error = None;
         self.desired_pause = false;
         self.publish();
@@ -322,7 +323,7 @@ impl Core {
                         event: BackendEvent::Buffering(true),
                     })
                     .await;
-                let backend = Mpv::load(
+                let backend = Player::load(
                     &media.url,
                     &media.headers,
                     position,
@@ -636,17 +637,6 @@ impl Core {
                     PlaybackState::Paused
                 } else {
                     PlaybackState::Playing
-                }
-            }
-            BackendEvent::Pause(paused) => {
-                // Only the core changes the desired pause state. Ignore older acknowledgements.
-                if paused == self.desired_pause && self.state.state != PlaybackState::Error {
-                    self.state.state = if paused {
-                        PlaybackState::Paused
-                    } else {
-                        PlaybackState::Playing
-                    };
-                    self.last_position = Instant::now();
                 }
             }
             BackendEvent::Buffering(buffering)

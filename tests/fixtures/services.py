@@ -141,7 +141,7 @@ setTimeout(()=>lx.send(EVENT_NAMES.inited,{sources:{wy:{type:'music',actions:['m
 Server.source = source_code
 
 with tempfile.TemporaryDirectory(prefix='yuin-services-') as root:
-    env = {**os.environ, 'YUIN_DATA_DIR': root + '/data', 'YUIN_MPV': str(Path(__file__).with_name('mpv.py').resolve()), 'YUIN_CATALOG_BASE': base}
+    env = {**os.environ, 'YUIN_DATA_DIR': root + '/data', 'YUIN_AUDIO_OUTPUT': 'null', 'YUIN_CATALOG_BASE': base}
     def output(*args):
         begin = time.monotonic()
         result = subprocess.run([binary, *map(str, args), '--json'], env=env, capture_output=True, text=True, timeout=100)

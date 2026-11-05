@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Opt-in PTY check; uses isolated data and generated silent audio.
 
-Usage: python3 scripts/verify-tui.py target/release/yuin [--real-mpv] [--large-playlist]
-Default mode uses tests/fixtures/mpv.py. --real-mpv uses mpv on PATH.
+Usage: python3 scripts/verify-tui.py target/release/yuin [--real-audio] [--large-playlist]
+Default mode decodes real audio with a silent clocked output. --real-audio opens the system audio device.
 --large-playlist checks 649 tracks and snapshots larger than 1 MiB.
 """
 import contextlib
@@ -28,7 +28,7 @@ import urllib.parse
 import zlib
 
 binary = str(Path(sys.argv[1]).resolve())
-real = "--real-mpv" in sys.argv[2:]
+real = "--real-audio" in sys.argv[2:]
 playlist_size = 649 if '--large-playlist' in sys.argv[2:] else 2
 with tempfile.TemporaryDirectory(prefix="yuin-pty-") as directory:
     env = {**os.environ, "YUIN_DATA_DIR": str(Path(directory) / "data"), "TERM": "xterm-256color", "TERM_PROGRAM": "WezTerm", "COLORTERM": "truecolor"}
@@ -73,9 +73,8 @@ with tempfile.TemporaryDirectory(prefix="yuin-pty-") as directory:
     catalog = http.server.ThreadingHTTPServer(('127.0.0.1', 0), CatalogFixture)
     threading.Thread(target=catalog.serve_forever, daemon=True).start()
     env['YUIN_CATALOG_BASE'] = f'http://127.0.0.1:{catalog.server_port}'
-    env["YUIN_MPV"] = shutil.which("mpv") if real else str(Path(__file__).resolve().parent.parent / "tests/fixtures/mpv.py")
-    if not env["YUIN_MPV"]:
-        raise RuntimeError("mpv is required for --real-mpv")
+    env.pop('YUIN_MPV', None)
+    env['YUIN_AUDIO_OUTPUT'] = 'default' if real else 'null'
 
     def cli(*args):
         result = subprocess.run([binary, *args, "--json"], env=env, capture_output=True, text=True, timeout=25, check=True)
@@ -222,6 +221,17 @@ with tempfile.TemporaryDirectory(prefix="yuin-pty-") as directory:
             assert CatalogFixture.cover_requests.count('/cover3.png') == 1
             assert any(image[0] == playing_image_id for image in image_commands(marker))
             assert all(image[0] != preview_image_id for image in image_commands(marker))
+            # Lyrics focus follows playback; queue focus must still preview selection.
+            os.write(master, b'l')
+            pump(.5)
+            marker = len(transcript)
+            os.write(master, b'\tjj')
+            pump(.5)
+            assert any(image[0] == preview_image_id for image in image_commands(marker)), 'Queue navigation in lyrics view did not update the cover preview'
+            assert all(image[0] != playing_image_id for image in image_commands(marker)), 'Queue preview changed the playing cover'
+            assert cli('status')['current'] == song_playing['current']
+            os.write(master, b'\x1b[Zl')
+            pump(.4)
             requests = len(CatalogFixture.cover_requests)
             os.write(master, b'k')
             pump(.4)
@@ -257,7 +267,7 @@ with tempfile.TemporaryDirectory(prefix="yuin-pty-") as directory:
         if real:
             time.sleep(0.3)
             assert cli("status")["position"] > after["position"]
-        print(f"PTY PASS ({'real mpv' if real else 'fixture'}): {playlist_size}-track playlist F/b, independent cover previews/cache/debounce, controls, resize and clean exit")
+        print(f"PTY PASS ({'system audio' if real else 'native decoder / silent output'}): {playlist_size}-track playlist F/b, independent cover previews/cache/debounce, controls, resize and clean exit")
     finally:
         if child and child.poll() is None:
             child.kill()

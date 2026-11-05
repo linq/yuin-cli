@@ -36,7 +36,9 @@ formula = f'''class Yuin < Formula
   homepage {json.dumps(args.repository)}
   version {json.dumps(args.version)}
   license {license_value}
-  depends_on "mpv"
+  on_linux do
+    depends_on "alsa-lib"
+  end
 
 {chr(10).join(blocks)}
 

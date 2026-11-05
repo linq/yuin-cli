@@ -5,7 +5,7 @@ use uuid::Uuid;
 #[derive(Parser)]
 #[command(name = "yuin", version, about = "Yuin · music in your terminal")]
 #[command(
-    after_help = "Install mpv for audio. Online tracks require an explicitly imported and enabled LX source.\nCLI and TUI share the same daemon, queue, library and download tasks."
+    after_help = "Built-in audio playback; no mpv installation needed. Online tracks require an explicitly imported and enabled LX source.\nCLI and TUI share the same daemon, queue, library and download tasks."
 )]
 pub struct Cli {
     /// Emit a versioned JSON document (errors go to stderr)

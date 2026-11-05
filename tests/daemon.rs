@@ -16,7 +16,9 @@ struct Session {
     root: TempDir,
     data: PathBuf,
     runtime: PathBuf,
-    mpv: PathBuf,
+    audio_output: String,
+    server: std::process::Child,
+    catalog: String,
 }
 
 impl Session {
@@ -30,11 +32,25 @@ impl Session {
             .unwrap();
         assert!(output.status.success());
         let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let mut server = Command::new("python3")
+            .arg("-u")
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/audio.py"))
+            .arg(root.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut catalog = String::new();
+        BufReader::new(server.stdout.take().unwrap())
+            .read_line(&mut catalog)
+            .unwrap();
         Self {
+            server,
+            catalog: catalog.trim().to_string(),
+            audio_output: "null".into(),
             root,
             data,
             runtime: PathBuf::from(value["runtime"].as_str().unwrap()),
-            mpv: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mpv.py"),
         }
     }
 
@@ -42,8 +58,9 @@ impl Session {
         let mut command = Command::new(env!("CARGO_BIN_EXE_yuin"));
         command
             .env("YUIN_DATA_DIR", &self.data)
-            .env("YUIN_MPV", &self.mpv)
-            .env("YUIN_FIXTURE_MARKER", self.root.path().join("starts"))
+            .env("YUIN_AUDIO_OUTPUT", &self.audio_output)
+            .env("YUIN_CATALOG_BASE", &self.catalog)
+            .env("YUIN_MPV", self.root.path().join("must-not-be-used"))
             .stdin(Stdio::null());
         command
     }
@@ -69,7 +86,7 @@ impl Session {
 
     fn audio(&self, name: &str) -> PathBuf {
         let path = self.root.path().join(name);
-        // A generated 60-second PCM WAV; also usable for the opt-in real mpv test.
+        // Generated 60-second PCM WAV, decoded in every playback test.
         let size = 8000_u32 * 2 * 60;
         let mut file = fs::File::create(&path).unwrap();
         file.write_all(b"RIFF").unwrap();
@@ -85,6 +102,16 @@ impl Session {
         file.write_all(b"data").unwrap();
         file.write_all(&size.to_le_bytes()).unwrap();
         file.write_all(&vec![0_u8; size as usize]).unwrap();
+        if name == "slow-start.wav" {
+            let source = self.root.path().join("source.js");
+            fs::write(&source, format!("/* @name Delayed audio */\nlx.on(lx.EVENT_NAMES.request,async()=>({{url:'{}/slow.wav'}}));lx.send(lx.EVENT_NAMES.inited,{{sources:{{wy:{{type:'music',actions:['musicUrl'],qualitys:['128k','320k']}}}}}});", self.catalog)).unwrap();
+            let id = self.json(&["source", "import", source.to_str().unwrap()])["source"]["id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            self.json(&["source", "use", &id]);
+            return PathBuf::from("wy:1");
+        }
         path
     }
 
@@ -128,6 +155,8 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.stop();
+        let _ = self.server.kill();
+        let _ = self.server.wait();
         let _ = fs::remove_dir_all(&self.runtime);
     }
 }
@@ -216,7 +245,7 @@ fn concurrent_clients_share_one_queue_and_transactional_recovery() {
 }
 
 #[test]
-fn playback_controls_persist_and_restore_without_starting_mpv() {
+fn native_playback_controls_persist_and_restore_without_opening_audio() {
     let session = Session::new();
     let audio = session.audio("local audio.wav");
     let playing = session.json(&["play", audio.to_str().unwrap()]);
@@ -226,16 +255,11 @@ fn playback_controls_persist_and_restore_without_starting_mpv() {
     assert_eq!(session.json(&["seek", "17"])["position"], 17.0);
     assert_eq!(session.json(&["volume", "42"])["volume"], 42);
     session.stop();
-    let starts = fs::read_to_string(session.root.path().join("starts")).unwrap();
     let restored = session.json(&["status"]);
     assert_eq!(restored["state"], "paused");
     assert_eq!(restored["position"], 17.0);
     assert_eq!(restored["volume"], 42);
     assert_eq!(restored["current"], playing["current"]);
-    assert_eq!(
-        fs::read_to_string(session.root.path().join("starts")).unwrap(),
-        starts
-    );
     assert_eq!(session.json(&["resume"])["state"], "playing");
     session.json(&["queue", "add", audio.to_str().unwrap()]);
     let next = session.json(&["next"]);
@@ -255,13 +279,16 @@ fn playback_controls_persist_and_restore_without_starting_mpv() {
 }
 
 #[test]
-fn missing_backend_and_decode_failure_return_audio_errors() {
+fn output_and_decode_failures_return_audio_errors() {
     for missing in [true, false] {
         let mut session = Session::new();
         if missing {
-            session.mpv = session.root.path().join("missing-mpv");
+            session.audio_output = "missing-output".into();
         }
         let audio = session.audio("invalid-audio.wav");
+        if !missing {
+            fs::write(&audio, b"<html>not audio</html>").unwrap();
+        }
         let output = session.output(&["play", audio.to_str().unwrap()]);
         assert_eq!(
             output.status.code(),
@@ -348,7 +375,7 @@ fn protocol_rejects_bad_requests_and_bounds_input() {
 }
 
 #[test]
-fn subscriptions_send_ordered_snapshots_and_backend_exit_is_recoverable() {
+fn subscriptions_send_ordered_snapshots_and_decode_failure_is_recoverable() {
     let session = Session::new();
     session.json(&["status"]);
     let mut stream = UnixStream::connect(session.runtime.join("daemon.sock")).unwrap();
@@ -366,11 +393,17 @@ fn subscriptions_send_ordered_snapshots_and_backend_exit_is_recoverable() {
     let event: Value = serde_json::from_str(&line).unwrap();
     assert!(event["sequence"].as_u64().unwrap() > initial["result"]["sequence"].as_u64().unwrap());
     assert_eq!(event["snapshot"]["volume"], 25);
-    let audio = session.audio("crash-on-seek.wav");
-    session.json(&["play", audio.to_str().unwrap()]);
-    let output = session.output(&["seek", "4"]);
-    assert_eq!(output.status.code(), Some(5));
+    let audio = session.audio("recover.wav");
+    fs::write(&audio, b"not audio").unwrap();
+    assert_eq!(
+        session
+            .output(&["play", audio.to_str().unwrap()])
+            .status
+            .code(),
+        Some(5)
+    );
     session.wait_state("error");
+    session.audio("recover.wav");
     assert_eq!(session.json(&["resume"])["state"], "playing");
 }
 
@@ -406,12 +439,10 @@ fn unsafe_runtime_directory_is_rejected() {
 }
 
 #[test]
-#[ignore = "requires installed mpv and explicit real-backend opt-in"]
-fn real_mpv_controls_and_restart() {
+#[ignore = "requires a physical system audio output device"]
+fn real_audio_controls_and_restart() {
     let mut session = Session::new();
-    session.mpv = std::env::var_os("YUIN_REAL_MPV")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new("mpv").into());
+    session.audio_output = "default".into();
     let audio = session.audio("real silence.wav");
     assert_eq!(
         session.json(&["play", audio.to_str().unwrap()])["state"],
@@ -465,7 +496,7 @@ fn a_disconnected_loading_request_is_cancelled_and_status_remains_responsive() {
 }
 
 #[test]
-fn killing_the_daemon_closes_mpv_and_stale_socket_is_recovered() {
+fn native_playback_has_no_child_player_and_stale_socket_is_recovered() {
     let session = Session::new();
     let mut daemon = session
         .command()
@@ -481,26 +512,23 @@ fn killing_the_daemon_closes_mpv_and_stale_socket_is_recovered() {
     }
     let audio = session.audio("owned.wav");
     session.json(&["play", audio.to_str().unwrap()]);
+    let processes = Command::new("ps")
+        .args(["-eo", "ppid=,comm="])
+        .output()
+        .unwrap();
+    let parent = daemon.id().to_string();
+    assert!(
+        !String::from_utf8_lossy(&processes.stdout)
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some(parent.as_str())),
+        "Local playback started a child process"
+    );
     daemon.kill().unwrap();
     daemon.wait().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while !session.root.path().join("starts.exits").exists() {
-        assert!(
-            Instant::now() < deadline,
-            "Player did not exit when daemon connection closed"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
     let recovered = session.json(&["status"]);
     assert_eq!(recovered["state"], "paused");
     assert_eq!(recovered["queue"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        fs::read_to_string(session.root.path().join("starts"))
-            .unwrap()
-            .lines()
-            .count(),
-        1
-    );
+    assert_eq!(session.json(&["resume"])["state"], "playing");
 }
 
 #[test]
@@ -570,18 +598,11 @@ fn fade_can_be_interrupted_by_stop_without_leaving_old_audio() {
     session.json(&["play", first.to_str().unwrap()]);
     session.json(&["play", second.to_str().unwrap()]);
     assert_eq!(session.json(&["stop"])["state"], "idle");
-    let pids = fs::read_to_string(session.root.path().join("starts")).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        let living = pids
-            .lines()
-            .any(|pid| unsafe { libc::kill(pid.parse().unwrap(), 0) } == 0);
-        if !living {
-            break;
-        }
-        assert!(Instant::now() < deadline, "Old fade player survived stop");
-        thread::sleep(Duration::from_millis(20));
-    }
+    thread::sleep(Duration::from_millis(500));
+    let stopped = session.json(&["status"]);
+    assert_eq!(stopped["state"], "idle");
+    assert_eq!(stopped["position"], 0.0);
+    assert!(stopped["error"].is_null());
 }
 
 #[test]
@@ -613,7 +634,11 @@ fn cancelled_playlist_load_restores_old_queue_and_keeps_concurrent_additions() {
     session.json(&["library", "add", &id, next.to_str().unwrap()]);
     let mut socket = UnixStream::connect(session.runtime.join("daemon.sock")).unwrap();
     writeln!(socket,"{}",json!({"version":1,"request_id":"7000d328-94fb-4b96-9861-75424d9297b0","method":"play_library","params":{"id":id}})).unwrap();
-    session.wait_state("buffering");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !session.root.path().join("starts").exists() {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
     let during = session.json(&["queue", "add", added.to_str().unwrap()]);
     assert_eq!(during["queue"].as_array().unwrap().len(), 3);
     drop(socket);

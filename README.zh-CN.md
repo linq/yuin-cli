@@ -8,7 +8,7 @@ Rust 编写的余音终端版；命令为 **yuin**。CLI 与 TUI 共用一个后
 
 - 五平台公开歌曲搜索、歌单与榜单：网易云 wy、酷我 kw、QQ tx、酷狗 kg、咪咕 mg；保存完整列表时核对分页与数量。
 - 独立 QuickJS worker 执行 LX API 2.0 源；本地／在线导入、显式启用、能力检查、脚本快照与 SHA-256、候选更新失败回滚。
-- mpv 本地／在线播放、暂停／继续、定位、音量、切歌；独立 UUID 队列、重排、顺序／随机／单曲循环；重启默认暂停。
+- 内置音频引擎本地／在线播放、暂停／继续、定位、音量、切歌；独立 UUID 队列、重排、顺序／随机／单曲循环；重启默认暂停。
 - 个人列表、收藏、历史、最多双并发下载、完整解码和音质校验、取消／重试、离线播放。
 - TUI 真实列表与搜索、分页保位、歌词、终端／深／浅主题、中英文、可选旧曲淡出和系统媒体控制。
 - JSON 导入预览、备份后的事务导入、私有导出、Shell 补全、man 手册、压缩包／macOS 安装包及发行工作流。
@@ -17,7 +17,7 @@ Rust 编写的余音终端版；命令为 **yuin**。CLI 与 TUI 共用一个后
 
 ## 启动
 
-需要单独安装 Rust stable 与 mpv。macOS 可用 `brew install mpv`；本机验收为 mpv 0.41.0，项目不捆绑 mpv。
+源码构建需要 Rust stable。音频通过内置 Symphonia 解码与系统设备输出，macOS 无需安装 mpv 或 Homebrew 音频依赖。Linux 构建需要 `libasound2-dev` 和 `pkg-config`，运行需要 ALSA。
 
 ```sh
 ./scripts/cargo.sh build --release --locked
@@ -97,7 +97,7 @@ yuin lyrics wy:123456
 
 默认采用 Catppuccin Macchiato 配色，包含深蓝灰背景、淡紫色选中行、蓝色交互提示和绿色播放状态；也可切换终端默认、深色或浅色主题。
 
-Ghostty、WezTerm 和 Kitty 在窗口宽高足够时显示双封面：右侧大图跟随当前选中的歌单／歌曲，仅展示居中的封面图片；底部播放栏的小图始终跟随正在播放的歌曲。选中项停留约 200 ms 后加载，封面有内存缓存；快速浏览和实际切歌互不影响。我的列表没有独立封面时，使用歌单内歌曲的封面作预览；没有浏览选中项或进入歌词视图时，大图显示正在播放的歌曲。缺少封面时预览区留空，窄窗口自动收起图片，tmux/screen 和不支持图片的终端使用文字界面。获取失败不会影响播放。
+Ghostty、WezTerm 和 Kitty 在窗口宽高足够时显示双封面：右侧大图跟随当前选中的歌单／歌曲，仅展示居中的封面图片；底部播放栏的小图始终跟随正在播放的歌曲。选中项停留约 200 ms 后加载，封面有内存缓存；快速浏览和实际切歌互不影响。我的列表没有独立封面时，使用歌单内歌曲的封面作预览；没有浏览选中项或焦点在歌词区时，大图显示正在播放的歌曲；歌词视图中切到队列后，大图仍跟随队列选中的歌曲。缺少封面时预览区留空，窄窗口自动收起图片，tmux/screen 和不支持图片的终端使用文字界面。获取失败不会影响播放。
 
 在歌单／排行榜列表或详情中按 **F（Shift+f）** 收藏整个歌单，按 **b** 播放整个歌单；“我的列表”中的歌单也可按 b 播放。小写 f 在歌曲详情中仍收藏单曲，在歌单列表中收藏选中的整个歌单。输入搜索文字时，这些按键只输入文字。
 
@@ -118,7 +118,7 @@ yuin config set media_keys true           # 设置后重启 daemon
 
 ## 数据、迁移、发行
 
-`paths --json` 查询独立的配置／数据／缓存／runtime。`YUIN_DATA_DIR` 可指定绝对根目录隔离测试；`YUIN_MPV` 可覆盖可执行文件，不拼接 Shell 参数。
+`paths --json` 查询独立的配置／数据／缓存／runtime。`YUIN_DATA_DIR` 可指定绝对根目录隔离测试；不再使用 `YUIN_MPV`；默认直接输出到系统音频设备。`YUIN_AUDIO_OUTPUT=null` 仅用于无声诊断／自动测试，仍进行真实解码，不是默认降级方式。
 
 ```sh
 yuin export '/绝对路径/备份.json' --include-sources
@@ -134,6 +134,18 @@ yuin man
 
 [安装与打包说明](packaging/INSTALL.md) 包含压缩包、unsigned macOS `.pkg` 与 Homebrew 生成器。项目仓库为 [linq/yuin-cli](https://github.com/linq/yuin-cli)，采用 [Apache-2.0 许可证](LICENSE)。生成的 Homebrew 公式需要对应发行产物上传后才能安装。当前安装包未签名／公证；Windows 播放不在本次验收范围。
 
+## 停止后台播放
+
+退出 TUI（`q`）仍保留后台播放。可在另一个终端运行：
+
+```sh
+yuin pause          # 暂停，保留当前歌曲与进度；yuin resume 继续
+yuin stop           # 停止，保留队列，重置当前歌曲与进度
+yuin daemon stop    # 停止音频并关闭后台服务；下次启动恢复为暂停
+```
+
+在 TUI 内按空格暂停／继续，按 `s` 停止。更新二进制后，先运行 `yuin daemon stop`，再重新打开 TUI，后台服务才会使用新后端。
+
 ## 验证
 
 ```sh
@@ -143,9 +155,9 @@ yuin man
 python3 scripts/verify-tui.py target/release/yuin
 
 # 显式运行真实设备／服务检查
-./scripts/cargo.sh test --locked --test daemon real_mpv_controls_and_restart -- --ignored
-python3 scripts/verify-tui.py target/release/yuin --real-mpv
+./scripts/cargo.sh test --locked --test daemon real_audio_controls_and_restart -- --ignored
+python3 scripts/verify-tui.py target/release/yuin --real-audio
 python3 scripts/verify-real.py target/release/yuin --source '/路径/可信源.js'
 ```
 
-默认测试需要 Python 3，仅使用本地 HTTP、受控 JS、合成静音和 mpv 协议 fixture，不访问音乐平台或音频设备。仓库保留依赖说明与合成测试音频来源，不分发第三方音乐源或录制音乐。
+默认测试需要 Python 3，仅使用本地 HTTP、受控 JS、合成音频、真实 Symphonia 解码和按时钟消费 PCM 的无声输出，不访问音乐平台或音频设备。仓库保留依赖说明与合成测试音频来源，不分发第三方音乐源或录制音乐。

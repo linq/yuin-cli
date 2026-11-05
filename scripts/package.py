@@ -108,5 +108,5 @@ with tempfile.TemporaryDirectory(prefix='yuin-package-') as temp:
         digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
         artifact.with_name(artifact.name + '.sha256').write_text(f'{digest}  {artifact.name}\n')
         records.append({'name': artifact.name, 'sha256': digest, 'bytes': artifact.stat().st_size})
-    (args.output / f'{name}.manifest.json').write_text(json.dumps({'schema_version': 1, 'version': version, 'target': args.target, 'artifacts': records, 'mpv_bundled': False}, indent=2) + '\n')
+    (args.output / f'{name}.manifest.json').write_text(json.dumps({'schema_version': 1, 'version': version, 'target': args.target, 'artifacts': records, 'audio_backend': 'symphonia+rodio', 'external_player_required': False}, indent=2) + '\n')
     print(json.dumps(records, indent=2))

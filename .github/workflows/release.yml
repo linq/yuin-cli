@@ -40,6 +40,9 @@ jobs:
               assert os.environ['TAG_NAME'] == 'v' + version, 'Tag must match Cargo.toml'
               assert re.search(r'^license\s*=', text, re.M), 'Choose a project license before publishing'
           PY
+      - name: Install Linux audio build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked

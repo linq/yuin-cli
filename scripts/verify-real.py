@@ -73,7 +73,7 @@ with tempfile.TemporaryDirectory(prefix='yuin-real-') as root:
                         break
                     time.sleep(.1)
                 else:
-                    raise RuntimeError('mpv did not advance in 15 seconds')
+                    raise RuntimeError('Built-in player did not advance in 15 seconds')
                 checks['playback'] = 'passed'
                 cli('stop')
                 if platform == args.download_platform:

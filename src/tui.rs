@@ -537,18 +537,14 @@ impl View {
             .snapshot
             .current_entry()
             .map(|entry| cover::Target::track(entry.track.clone()));
-        let selected = if self.lyrics_mode {
-            None
-        } else {
-            match self.focus {
-                1 => self.browser.cover_target(self.page),
-                2 => self
-                    .queue
-                    .selected()
-                    .and_then(|index| self.snapshot.queue.get(index))
-                    .map(|entry| cover::Target::track(entry.track.clone())),
-                _ => None,
-            }
+        let selected = match self.focus {
+            1 if !self.lyrics_mode => self.browser.cover_target(self.page),
+            2 => self
+                .queue
+                .selected()
+                .and_then(|index| self.snapshot.queue.get(index))
+                .map(|entry| cover::Target::track(entry.track.clone())),
+            _ => None,
         };
         let mut changed = self.playing_cover.set(current.clone(), Duration::ZERO);
         changed |= self
@@ -1028,5 +1024,79 @@ fn draw_cover(frame: &mut Frame, view: &mut View, cover: Rect) {
     );
     if view.preview.png.is_some() {
         view.preview.area = Some(image);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{QueueEntry, Track};
+    use uuid::Uuid;
+
+    #[test]
+    fn lyrics_queue_navigation_updates_preview_without_changing_playing_cover() {
+        let queue = (1..=2)
+            .map(|number| QueueEntry {
+                id: Uuid::new_v4(),
+                track: serde_json::from_value::<Track>(serde_json::json!({
+                    "id": format!("wy:{number}"),
+                    "title": format!("Song {number}"),
+                    "artist": "Fixture",
+                    "artwork": format!("https://example.test/{number}.png")
+                }))
+                .unwrap(),
+            })
+            .collect::<Vec<_>>();
+        let playing = cover::Target::track(queue[0].track.clone()).key;
+        let selected = cover::Target::track(queue[1].track.clone()).key;
+        let config = Config::default();
+        let mut view = View {
+            lyrics_mode: true,
+            lyric_track: None,
+            lyrics: None,
+            snapshot: Snapshot {
+                current: Some(queue[0].id),
+                queue,
+                ..Snapshot::default()
+            },
+            page: 1,
+            focus: 2,
+            queue: ListState::default().with_selected(Some(0)),
+            message: String::new(),
+            browser: Browser::new(config.platform, false),
+            config,
+            cover_supported: true,
+            preview: cover::State::default(),
+            playing_cover: cover::State::default(),
+        };
+        let (actions, _updates) = mpsc::channel(8);
+        view.sync_covers(&actions);
+        assert_eq!(view.preview.key(), Some(playing.as_str()));
+        view.navigate(1, &actions);
+        assert_eq!(view.queue.selected(), Some(1));
+        view.sync_covers(&actions);
+        assert_eq!(
+            view.preview.key(),
+            Some(selected.as_str()),
+            "Lyrics view must preview the selected queue track"
+        );
+        assert_eq!(view.playing_cover.key(), Some(playing.as_str()));
+
+        view.focus = 1;
+        view.sync_covers(&actions);
+        assert_eq!(
+            view.preview.key(),
+            Some(playing.as_str()),
+            "Lyrics focus should follow actual playback"
+        );
+        view.snapshot.current = Some(view.snapshot.queue[1].id);
+        view.sync_covers(&actions);
+        assert_eq!(view.preview.key(), Some(selected.as_str()));
+        assert_eq!(view.playing_cover.key(), Some(selected.as_str()));
+        view.focus = 2;
+        view.navigate(-1, &actions);
+        view.sync_covers(&actions);
+        assert_eq!(view.preview.key(), Some(playing.as_str()));
+        assert_eq!(view.playing_cover.key(), Some(selected.as_str()));
     }
 }
