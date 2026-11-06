@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 #[derive(Debug)]
 pub enum BackendEvent {
     Loaded,
-    Position(f64),
+    Position { seconds: f64, observed_at: Instant },
     Duration(f64),
     Buffering(bool),
     Ended,
@@ -199,7 +199,15 @@ impl Player {
                         else {
                             let now = observed.buffering.load(Ordering::Acquire);
                             if now != buffering { buffering = now; BackendEvent::Buffering(now) }
-                            else { BackendEvent::Position(observed.position.load(Ordering::Acquire) as f64 / rate as f64) }
+                            else {
+                                // Timestamp before sampling so a concurrent seek can reject
+                                // observations made before it completed.
+                                let observed_at = Instant::now();
+                                BackendEvent::Position {
+                                    seconds: observed.position.load(Ordering::Acquire) as f64 / rate as f64,
+                                    observed_at,
+                                }
+                            }
                         }
                     }
                 };

@@ -291,11 +291,20 @@ pub async fn run() -> Result<()> {
     services.downloads.shutdown().await;
     services.sources.stop().await;
     signals.abort();
-    // Let the shutdown request's response flush before closing clients.
-    sleep(Duration::from_millis(100)).await;
+    drain_connections(&mut connections).await;
+    result
+}
+
+async fn drain_connections(connections: &mut JoinSet<()>) {
+    // A shutdown snapshot can contain the whole queue and exceed the socket
+    // buffer. Wait for actual completion, not a fixed delay that can truncate it.
+    // Bound the grace period so idle clients and subscriptions cannot block exit.
+    let _ = timeout(Duration::from_secs(2), async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await;
     connections.abort_all();
     while connections.join_next().await.is_some() {}
-    result
 }
 
 async fn serve(
@@ -489,3 +498,32 @@ async fn serve(
 }
 
 use tokio::io::AsyncBufReadExt;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shutdown_drains_a_large_response_to_a_slow_reader() {
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        let payload = "x".repeat(1024 * 1024);
+        let expected = payload.clone();
+        let mut connections = JoinSet::new();
+        connections.spawn(async move {
+            send_response(&mut writer, &payload).await.unwrap();
+        });
+        let client = tokio::spawn(async move {
+            // Exceed the old 100 ms shutdown delay and force socket backpressure.
+            sleep(Duration::from_millis(300)).await;
+            let frame = read_frame_with_limit(&mut BufReader::new(reader), MAX_RESPONSE_FRAME)
+                .await
+                .unwrap()
+                .unwrap();
+            serde_json::from_slice::<String>(&frame).unwrap()
+        });
+
+        drain_connections(&mut connections).await;
+        assert!(connections.is_empty());
+        assert_eq!(client.await.unwrap(), expected);
+    }
+}

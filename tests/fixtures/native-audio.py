@@ -92,9 +92,15 @@ with tempfile.TemporaryDirectory(prefix='yuin-native-') as root:
             before = run('status')['position']
             time.sleep(.2)
             assert abs(run('status')['position']-before) < .08
-            threading.Timer(.25, Server.release.set).start()
-            run('seek','5')
-            assert abs(run('status')['position']-5) < .05
+            # Keep the seek waiting across multiple 100 ms monitor ticks.
+            # Queued pre-seek positions must not overwrite its acknowledged target.
+            threading.Timer(.35, Server.release.set).start()
+            sought = run('seek','5')
+            assert abs(sought['position']-5) < .05, sought
+            for _ in range(8):
+                snapshot = run('status')
+                assert abs(snapshot['position']-5) < .05, snapshot
+                time.sleep(.025)
             run('volume','23'); run('resume')
             deadline = time.monotonic()+2
             while run('status')['position'] <= 5:

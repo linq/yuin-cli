@@ -260,7 +260,7 @@ with tempfile.TemporaryDirectory(prefix="yuin-pty-") as directory:
             ready, _, _ = select.select([master], [], [], 0.05)
             if ready:
                 read_output()
-        assert child.poll() == 0, f"Exit code: {child.poll()}"
+        assert child.poll() == 0, f"Exit code: {child.poll()}; terminal output: {bytes(transcript[-2000:])!r}"
         assert termios.tcgetattr(slave) == original, "Terminal settings were not restored"
         after = cli("status")
         assert after["state"] == "playing" and after["current"] == playing["current"]
