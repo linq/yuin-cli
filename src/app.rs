@@ -49,6 +49,7 @@ pub struct Core {
     generation: u64,
     desired_pause: bool,
     last_position: Instant,
+    seek_completed: Option<std::time::Instant>,
     checkpoint_position: f64,
 }
 
@@ -81,6 +82,7 @@ impl Core {
             generation: 0,
             desired_pause: true,
             last_position: Instant::now(),
+            seek_completed: None,
             checkpoint_position,
         })
     }
@@ -491,6 +493,7 @@ impl Core {
                         .map_or(seconds, |duration| seconds.min(duration));
                     if let Some(backend) = &mut self.backend {
                         backend.seek(seconds).await.map_err(audio_error)?;
+                        self.seek_completed = Some(std::time::Instant::now());
                     }
                     if self.loading.is_some() {
                         self.start_current(seconds).await?;
@@ -613,10 +616,19 @@ impl Core {
     }
 
     async fn backend_event(&mut self, event: BackendEvent) {
+        // Seeking can wait on HTTP while the monitor queues old positions.
+        // Those observations must not overwrite the acknowledged seek target.
+        if let BackendEvent::Position { observed_at, .. } = &event
+            && self.seek_completed.is_some_and(|seek| *observed_at < seek)
+        {
+            return;
+        }
         if self.loading.is_some() {
             match event {
                 BackendEvent::Duration(duration) => self.state.duration = Some(duration),
-                BackendEvent::Position(position) => self.state.position = position,
+                BackendEvent::Position {
+                    seconds: position, ..
+                } => self.state.position = position,
                 BackendEvent::Buffering(true) => {
                     self.state.state = PlaybackState::Buffering;
                     self.publish();
@@ -627,7 +639,9 @@ impl Core {
         }
 
         match event {
-            BackendEvent::Position(position) => {
+            BackendEvent::Position {
+                seconds: position, ..
+            } => {
                 self.state.position = position;
                 self.last_position = Instant::now();
             }
@@ -698,4 +712,48 @@ impl Core {
 
 fn audio_error(error: anyhow::Error) -> RpcError {
     RpcError::new(5, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn seek_rejects_queued_positions_but_accepts_new_observations() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = crate::paths::AppPaths {
+            schema_version: 1,
+            config: root.path().join("config.toml"),
+            data: root.path().to_path_buf(),
+            cache: root.path().join("cache"),
+            runtime: root.path().join("run"),
+        };
+        let storage = Storage::open(root.path().join("state.db")).await.unwrap();
+        let services = std::sync::Arc::new(
+            crate::services::Services::new(paths, storage.clone())
+                .await
+                .unwrap(),
+        );
+        let (events, _) = broadcast::channel(16);
+        let (latest, _) = watch::channel(storage.load().await.unwrap());
+        let mut core = Core::new(storage, events, latest, services).await.unwrap();
+        let completed = std::time::Instant::now();
+        core.state.position = 5.0;
+        core.seek_completed = Some(completed);
+
+        core.backend_event(BackendEvent::Position {
+            seconds: 0.25,
+            observed_at: completed - Duration::from_millis(100),
+        })
+        .await;
+        assert_eq!(core.state.position, 5.0);
+
+        // A fresh observation remains authoritative, even for a backward seek.
+        core.backend_event(BackendEvent::Position {
+            seconds: 4.0,
+            observed_at: completed + Duration::from_millis(100),
+        })
+        .await;
+        assert_eq!(core.state.position, 4.0);
+    }
 }

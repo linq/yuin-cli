@@ -253,14 +253,17 @@ with tempfile.TemporaryDirectory(prefix="yuin-pty-") as directory:
         read_until(b"Charts")
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 12, 60, 0, 0))
         child.send_signal(signal.SIGWINCH)
-        read_until(b"\x1b")
+        # Any escape sequence may be a frame queued before the resize. Wait for
+        # the footer at the new height before sending the next keyboard event.
+        read_until(b"\x1b[12;1H")
+        pump()
         os.write(master, b"q")
         deadline = time.monotonic() + 5
         while child.poll() is None and time.monotonic() < deadline:
             ready, _, _ = select.select([master], [], [], 0.05)
             if ready:
                 read_output()
-        assert child.poll() == 0, f"Exit code: {child.poll()}"
+        assert child.poll() == 0, f"Exit code: {child.poll()}; terminal output: {bytes(transcript[-2000:])!r}"
         assert termios.tcgetattr(slave) == original, "Terminal settings were not restored"
         after = cli("status")
         assert after["state"] == "playing" and after["current"] == playing["current"]
